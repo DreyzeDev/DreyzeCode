@@ -8,7 +8,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import { access, chmod, copyFile, lstat, mkdir, open, readdir, readFile, realpath, rename, stat, unlink, writeFile } from "node:fs/promises"
 import { fileURLToPath } from "node:url"
 
-export const VERSION = "0.4.0"
+export const VERSION = "0.4.1"
 const MAX_STEPS = 80
 const MAX_HISTORY = 40
 const MAX_MESSAGE_CHARS = 24_000
@@ -705,9 +705,11 @@ function actionJSON(action) {
 
 export async function runAgentTask({ config, catalog, session, store, roots, workspace, question, yes = false, fetchImpl = fetch, onOutput = () => {} }) {
   await recoverPendingAction(session, store)
+  const [projectInstructions, projectSkills] = await Promise.all([
+    loadProjectInstructions(roots),
+    loadProjectSkills(roots),
+  ])
   for (let step = 0; step < MAX_STEPS; step++) {
-    const projectInstructions = await loadProjectInstructions(roots)
-    const projectSkills = await loadProjectSkills(roots)
     const stopWaiting = startWaitIndicator(step)
     let action
     try {

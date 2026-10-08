@@ -295,7 +295,7 @@ test("requires a terminal response for ask_user actions", async (t) => {
   assert.equal(result.requiresInput, "Which project name?")
 })
 
-test("stores a write intent before execution and carries the result into the next agent turn", async (t) => {
+test("keeps a task's project guide and skill snapshot stable across tool turns", async (t) => {
   const { workspace, config } = await fixture(t)
   const store = createSessionStore(workspace, config)
   const session = await store.create("dreyze/test-model", "build")
@@ -335,6 +335,8 @@ test("stores a write intent before execution and carries the result into the nex
         description: "Follow project coding patterns.",
       }])
       if (calls === 1) {
+        await writeFile(path.join(workspace, "AGENTS.md"), "Changed after the task began.")
+        await writeFile(path.join(skillDirectory, "SKILL.md"), "---\nname: Changed\ndescription: Changed after the task began.\n---\n")
         return Response.json({ type: "tool", name: "write_file", input: { path: "created.txt", content: "hello" } })
       }
       return Response.json({ type: "final", content: "File created." })
@@ -492,7 +494,7 @@ test("runs the CLI when invoked through the symlink npm creates for its binary",
   await symlink(cli, command, "file")
   const child = spawnSync(command, ["--version"], { encoding: "utf8" })
   assert.equal(child.status, 0, child.stderr)
-  assert.equal(child.stdout, "DreyzeCode 0.4.0\n")
+  assert.equal(child.stdout, "DreyzeCode 0.4.1\n")
 })
 
 test("help documents image input in both one-shot and interactive modes", async () => {
