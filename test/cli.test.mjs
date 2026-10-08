@@ -95,6 +95,30 @@ test("shows a safe, bounded preview before asking to write a file", async (t) =>
   await assert.rejects(readFile(path.join(workspace, "new.txt"), "utf8"), { code: "ENOENT" })
 })
 
+test("renames a project folder and refuses to move a folder into itself", async (t) => {
+  const { workspace } = await fixture(t)
+  await mkdir(path.join(workspace, "old-name"))
+  const moved = await executeTool({
+    name: "move_file",
+    input: { source: "old-name", destination: "new-name" },
+  }, {
+    workspace,
+    roots: [workspace],
+    question: async () => "yes",
+  })
+  assert.match(moved.output, /Перемещено/u)
+  assert.equal(await realpath(path.join(workspace, "new-name")), path.join(workspace, "new-name"))
+  await assert.rejects(realpath(path.join(workspace, "old-name")), { code: "ENOENT" })
+  await assert.rejects(executeTool({
+    name: "move_file",
+    input: { source: "new-name", destination: "new-name/child" },
+  }, {
+    workspace,
+    roots: [workspace],
+    question: async () => "yes",
+  }), /внутрь самой себя/u)
+})
+
 test("redacts credentials embedded in JSON output, common tokens, and authenticated URLs", () => {
   const raw = JSON.stringify({
     GITHUB_TOKEN: "ghp_123456789012345678901234567890",

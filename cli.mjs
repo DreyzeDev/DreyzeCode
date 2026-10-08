@@ -475,9 +475,13 @@ export async function executeTool(action, { workspace, roots, approve, question 
     const source = await resolveWorkspacePath(getPath("source"), roots, { mustExist: true })
     const destination = await resolveWorkspacePath(getPath("destination"), roots)
     const sourceInfo = await stat(source)
-    if (!sourceInfo.isFile()) throw new Error("Копирование и перемещение папок пока не поддерживаются.")
+    if (action.name === "copy_file" && !sourceInfo.isFile()) throw new Error("Копировать можно только обычные файлы.")
+    if (action.name === "move_file" && roots.includes(source)) throw new Error("Нельзя перемещать корень разрешённой папки.")
+    if (action.name === "move_file" && sourceInfo.isDirectory() && within(source, destination)) {
+      throw new Error("Нельзя переместить папку внутрь самой себя.")
+    }
     await assertParentAllowed(destination, roots)
-    if (await access(destination).then(() => true, () => false)) throw new Error("Файл назначения уже существует.")
+    if (await access(destination).then(() => true, () => false)) throw new Error("Путь назначения уже существует.")
     if (!(await askApproval(action, { approve, question }))) return { output: "Действие отклонено пользователем." }
     if (action.name === "copy_file") await copyFile(source, destination)
     else await rename(source, destination)
