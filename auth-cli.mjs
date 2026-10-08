@@ -67,6 +67,7 @@ async function login(args) {
     method: "POST",
     headers: { "Content-Type": "application/json", Origin: url },
     body: JSON.stringify({ code, state, redirectUri: receiver.redirectUri, codeVerifier }),
+    redirect: "error",
     signal: AbortSignal.timeout(30_000),
   })
   const body = await response.json().catch(() => ({}))

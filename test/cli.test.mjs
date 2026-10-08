@@ -4,6 +4,7 @@ import os from "node:os"
 import path from "node:path"
 import { spawnSync } from "node:child_process"
 import test from "node:test"
+import { fileURLToPath } from "node:url"
 import {
   createSessionStore,
   apiGet,
@@ -11,7 +12,9 @@ import {
   fetchModelCatalog,
   isSensitivePath,
   parseArgs,
+  redactSecrets,
   recoverPendingAction,
+  resumeInteractiveSession,
   resolveWorkspacePath,
   runAgentTask,
 } from "../cli.mjs"
@@ -37,14 +40,22 @@ test("rejects traversal, symlink escapes, and sensitive reads", async (t) => {
   const outside = path.join(root, "outside")
   await mkdir(outside)
   await writeFile(path.join(outside, "private.txt"), "do not follow")
-  await symlink(outside, path.join(workspace, "escape"))
-  await symlink(path.join(outside, "private.txt"), path.join(workspace, "file-link"))
   await writeFile(path.join(workspace, ".env.local"), "SECRET=abcdefgh")
-  await symlink(path.join(workspace, ".env.local"), path.join(workspace, "ordinary-name"))
   await assert.rejects(resolveWorkspacePath("../outside/file.txt", [workspace]), /вне папок/u)
+  await assert.rejects(resolveWorkspacePath(".env.local", [workspace]), /секретных файлов/u)
+  try {
+    await symlink(outside, path.join(workspace, "escape"), process.platform === "win32" ? "junction" : undefined)
+    await symlink(path.join(outside, "private.txt"), path.join(workspace, "file-link"), "file")
+    await symlink(path.join(workspace, ".env.local"), path.join(workspace, "ordinary-name"), "file")
+  } catch (error) {
+    if (process.platform === "win32" && ["EPERM", "EACCES", "ENOTSUP"].includes(error?.code)) {
+      t.skip("Windows runner does not permit creating symlinks")
+      return
+    }
+    throw error
+  }
   await assert.rejects(resolveWorkspacePath("escape/file.txt", [workspace]), /символьную ссылку/u)
   await assert.rejects(resolveWorkspacePath("file-link", [workspace]), /символьную ссылку/u)
-  await assert.rejects(resolveWorkspacePath(".env.local", [workspace]), /секретных файлов/u)
   await assert.rejects(resolveWorkspacePath("ordinary-name", [workspace]), /секретных файлов/u)
   assert.equal(isSensitivePath("/project/id_ed25519"), true)
   assert.equal(isSensitivePath("/project/src/tokenizer.ts"), false)
@@ -63,6 +74,37 @@ test("denies a file write unless the user approves it", async (t) => {
   })
   assert.match(result.output, /отклонено/u)
   await assert.rejects(readFile(destination, "utf8"), { code: "ENOENT" })
+})
+
+test("shows a safe, bounded preview before asking to write a file", async (t) => {
+  const { workspace } = await fixture(t)
+  let prompt = ""
+  const result = await executeTool({
+    name: "write_file",
+    input: { path: "new.txt", content: `hello\n\u001b[2Jhidden terminal control` },
+  }, {
+    workspace,
+    roots: [workspace],
+    question: async (value) => { prompt = value; return "n" },
+  })
+  assert.match(prompt, /hello/u)
+  assert.match(prompt, /ANSI control omitted/u)
+  assert.doesNotMatch(prompt, /\u001b/u)
+  assert.match(result.output, /отклонено/u)
+  await assert.rejects(readFile(path.join(workspace, "new.txt"), "utf8"), { code: "ENOENT" })
+})
+
+test("redacts credentials embedded in JSON output, common tokens, and authenticated URLs", () => {
+  const raw = JSON.stringify({
+    GITHUB_TOKEN: "ghp_123456789012345678901234567890",
+    secret: "a-very-long-secret-value",
+    remote: "https://build-user:build-password@example.test/repo.git",
+    jwt: "eyJabcdefghijk.abcdefghijk.abcdefghijk",
+  })
+  const safe = redactSecrets(raw)
+  assert.doesNotMatch(safe, /123456789012345678901234567890|a-very-long-secret-value|build-user|build-password|eyJabcdefghijk/u)
+  assert.match(safe, /SECRET OMITTED/u)
+  assert.match(safe, /\[REDACTED\]@example.test/u)
 })
 
 test("requires a terminal response for ask_user actions", async (t) => {
@@ -102,6 +144,7 @@ test("stores a write intent before execution and carries the result into the nex
     fetchImpl: async (_url, init) => {
       calls++
       const request = JSON.parse(init.body)
+      assert.equal(init.redirect, "error")
       assert.equal(request.messages.length > 0, true)
       if (calls === 1) {
         return Response.json({ type: "tool", name: "write_file", input: { path: "created.txt", content: "hello" } })
@@ -132,10 +175,57 @@ test("converts an interrupted mutating action into an unknown-outcome notice wit
   await assert.rejects(readFile(path.join(workspace, "should-not-exist.txt"), "utf8"), { code: "ENOENT" })
 })
 
+test("resumes an interactive clarification once and prints its final response once", async () => {
+  const session = {
+    pendingQuestion: "Which name should I use?",
+    messages: [{ role: "assistant", content: "{\"type\":\"tool\",\"name\":\"ask_user\"}" }],
+  }
+  let saveCount = 0
+  let runCount = 0
+  const output = []
+  const resumed = await resumeInteractiveSession({
+    options: { continuing: true, yes: false },
+    config: {}, catalog: {}, session,
+    store: { save: async () => { saveCount++ } },
+    roots: [], workspace: "/project", recovered: false,
+    questioner: { ask: async () => "Storefront" },
+    runTask: async (args) => {
+      runCount++
+      assert.equal(args.session.pendingQuestion, null)
+      assert.equal(args.session.messages.at(-1).role, "user")
+      args.onOutput("Created Storefront.")
+      return { final: "Created Storefront." }
+    },
+    onOutput: (text) => output.push(text),
+  })
+  assert.equal(resumed, true)
+  assert.equal(runCount, 1)
+  assert.equal(saveCount, 1)
+  assert.deepEqual(output, ["Created Storefront."])
+})
+
+test("does not restart a recovered interactive session twice", async () => {
+  const session = { messages: [{ role: "user", content: "Continue the project" }] }
+  let runCount = 0
+  const resumed = await resumeInteractiveSession({
+    options: { continuing: true, yes: false },
+    config: {}, catalog: {}, session,
+    store: {}, roots: [], workspace: "/project", recovered: true,
+    questioner: { ask: async () => null },
+    runTask: async () => {
+      runCount++
+      session.messages.push({ role: "user", content: "Tool result" })
+    },
+  })
+  assert.equal(resumed, true)
+  assert.equal(runCount, 1)
+})
+
 test("lists only the validated Dreyze model catalog fields", async () => {
   const catalog = await fetchModelCatalog({ url: "https://moonfacet.example", cookie: "private-cookie" }, async (url, init) => {
     assert.equal(new URL(url).pathname, "/api/code/v1/models")
     assert.equal(init.headers.Cookie, "private-cookie")
+    assert.equal(init.redirect, "error")
     return Response.json({
       defaultModel: "dreyze/test",
       data: [{ id: "dreyze/test", name: "Dreyze Test", description: "Model", group: "notion", context_length: 100_000, supports_images: true, api_key: "must be ignored" }],
@@ -160,6 +250,20 @@ test("doctor reports missing login as JSON without making a network request", as
   assert.equal(result.auth.source, "missing")
   assert.deepEqual(result.hints, ["Выполните dreyzecode login."])
   assert.equal(child.stderr, "")
+})
+
+test("runs the CLI when invoked through the symlink npm creates for its binary", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("Windows symlink creation depends on runner privileges")
+    return
+  }
+  const { root } = await fixture(t)
+  const cli = fileURLToPath(new URL("../cli.mjs", import.meta.url))
+  const command = path.join(root, "dreyzecode")
+  await symlink(cli, command, "file")
+  const child = spawnSync(command, ["--version"], { encoding: "utf8" })
+  assert.equal(child.status, 0, child.stderr)
+  assert.equal(child.stdout, "DreyzeCode 0.1.0\n")
 })
 
 test("the raw API escape hatch rejects paths that normalize outside /api", async () => {

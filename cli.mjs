@@ -6,7 +6,7 @@ import { homedir } from "node:os"
 import { env, platform, stdin, stdout, stderr } from "node:process"
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { access, chmod, copyFile, lstat, mkdir, open, readdir, readFile, realpath, rename, stat, unlink, writeFile } from "node:fs/promises"
-import { fileURLToPath, pathToFileURL } from "node:url"
+import { fileURLToPath } from "node:url"
 
 export const VERSION = "0.1.0"
 const MAX_STEPS = 80
@@ -171,6 +171,7 @@ function safeError(body, fallback) {
 export async function fetchModelCatalog(config, fetchImpl = fetch) {
   const response = await fetchImpl(new URL("/api/code/v1/models", config.url), {
     headers: { Accept: "application/json", Cookie: config.cookie },
+    redirect: "error",
     cache: "no-store",
     signal: AbortSignal.timeout(10_000),
   })
@@ -334,9 +335,15 @@ async function resolveDesktopRoot() {
 
 async function askApproval(action, options) {
   if (options.yes) return true
+  const preview = (value) => {
+    const safe = String(value ?? "")
+      .replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "[ANSI control omitted]")
+      .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/gu, "�")
+    return safe.length <= 3_000 ? safe : `${safe.slice(0, 3_000)}\n[Preview shortened]`
+  }
   const descriptions = {
-    write_file: `Записать файл ${action.input.path}?`,
-    edit_file: `Изменить файл ${action.input.path}?`,
+    write_file: `Записать файл ${action.input.path}?\nСодержимое:\n${preview(action.input.content)}`,
+    edit_file: `Изменить файл ${action.input.path}?\nЗаменить:\n${preview(action.input.oldText)}\nНа:\n${preview(action.input.newText)}`,
     delete_file: `Удалить файл ${action.input.path}?`,
     copy_file: `Скопировать ${action.input.source} в ${action.input.destination}?`,
     move_file: `Переместить ${action.input.source} в ${action.input.destination}?`,
@@ -510,12 +517,13 @@ export async function executeTool(action, { workspace, roots, approve, question 
   throw new Error(`Инструмент ${action.name} не реализован.`)
 }
 
-function redactSecrets(value) {
+export function redactSecrets(value) {
   return value
     .replace(/(__Host-dreyzeai_session=)[^\s"'`,;]+/giu, "$1[REDACTED]")
     .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/gu, "[PRIVATE KEY OMITTED]")
-    .replace(/\b(?:sk-[A-Za-z0-9_-]{16,}|GOCSPX-[A-Za-z0-9_-]{12,}|re_[A-Za-z0-9_-]{16,}|AIza[A-Za-z0-9_-]{20,})\b/gu, "[API KEY OMITTED]")
-    .replace(/((?:api[_-]?key|secret|password|token|client[_-]?secret)\s*[=:]\s*["']?)([^\s"'`,;]{8,})/giu, "$1[SECRET OMITTED]")
+    .replace(/\b(?:sk-[A-Za-z0-9_-]{16,}|GOCSPX-[A-Za-z0-9_-]{12,}|re_[A-Za-z0-9_-]{16,}|AIza[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})\b/gu, "[API KEY OMITTED]")
+    .replace(/(["']?(?:api[_-]?key|secret|password|token|client[_-]?secret)["']?\s*[=:]\s*["']?)([^\s"'`,;]{8,})/giu, "$1[SECRET OMITTED]")
+    .replace(/((?:https?|ssh):\/\/)[^/@:\s]+:[^/@\s]+@/giu, "$1[REDACTED]@")
     .replace(/(Authorization\s*:\s*Bearer\s+)[A-Za-z0-9._~+/-]{12,}/giu, "$1[SECRET OMITTED]")
 }
 
@@ -541,6 +549,7 @@ async function callAgent(config, session, fetchImpl = fetch) {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json", Cookie: config.cookie },
     body: JSON.stringify({ model: session.model, mode: session.mode, messages: session.messages.slice(-MAX_HISTORY) }),
+    redirect: "error",
     signal: AbortSignal.timeout(160_000),
   })
   const body = await response.json().catch(() => ({}))
@@ -667,7 +676,7 @@ export async function apiGet(config, pathname, jsonMode) {
   if (typeof pathname !== "string" || !pathname.startsWith("/api/") || pathname.includes("\\")) throw new Error("api get принимает только путь /api/ на сервере Dreyze.")
   const url = new URL(pathname, config.url)
   if (url.origin !== config.url || !url.pathname.startsWith("/api/")) throw new Error("Запрос за пределы API Dreyze запрещён.")
-  const response = await fetch(url, { headers: { Accept: "application/json", Cookie: config.cookie }, signal: AbortSignal.timeout(15_000) })
+  const response = await fetch(url, { headers: { Accept: "application/json", Cookie: config.cookie }, redirect: "error", signal: AbortSignal.timeout(15_000) })
   const text = (await response.text()).slice(0, 100_000)
     .replace(/(__Host-dreyzeai_session=)[^\s"'`,;]+/giu, "$1[REDACTED]")
     .replace(/(Authorization\s*:\s*Bearer\s+)[A-Za-z0-9._~+/-]{12,}/giu, "$1[REDACTED]")
@@ -716,31 +725,65 @@ async function runPrompt(prompt, options, config, catalog, session, store, roots
   return result
 }
 
+export async function resumeInteractiveSession({
+  options,
+  config,
+  catalog,
+  session,
+  store,
+  roots,
+  workspace,
+  questioner,
+  recovered,
+  runTask = runAgentTask,
+  onOutput = (text) => stdout.write(`${text}\n`),
+}) {
+  if (!options.continuing) return false
+  if (session.pendingQuestion) {
+    const pendingQuestion = session.pendingQuestion
+    const answer = await questioner.ask(`${pendingQuestion}: `)
+    if (answer === null) {
+      onOutput(pendingQuestion)
+      return false
+    }
+    session.pendingQuestion = null
+    appendMessage(session, "user", `Ответ на уточнение «${pendingQuestion}»: ${answer}`)
+    await store.save(session)
+  }
+
+  const last = session.messages.at(-1)
+  if (!recovered && last?.role !== "user") return false
+  await runTask({
+    config,
+    catalog,
+    session,
+    store,
+    roots,
+    workspace,
+    question: questioner.ask,
+    yes: options.yes,
+    onOutput,
+  })
+  return true
+}
+
 async function interactive(options, config, catalog, session, store, roots, workspace, questioner) {
   let theme = await readTheme()
   let color = accent(theme)
   stdout.write(`${color("DreyzeCode")} · ${session.model} · ${session.mode}\nКоманды: /mode build|plan, /model ID, /theme purple|blue|system, /exit\n`)
   const recovered = await recoverPendingAction(session, store)
-  if (options.continuing && session.pendingQuestion) {
-    const pendingQuestion = session.pendingQuestion
-    const answer = await questioner.ask(`${pendingQuestion}: `)
-    if (answer === null) {
-      stdout.write(`${pendingQuestion}\n`)
-      return
-    }
-    session.pendingQuestion = null
-    appendMessage(session, "user", `Ответ на уточнение «${pendingQuestion}»: ${answer}`)
-    await store.save(session)
-    const result = await runAgentTask({ config, catalog, session, store, roots, workspace, question: questioner.ask, yes: options.yes, onOutput: (text) => stdout.write(`${text}\n`) })
-    if (result.final) stdout.write(`${result.final}\n`)
-  }
-  if (options.continuing && session.messages.length) {
-    const last = session.messages.at(-1)
-    if (recovered || last?.role === "user") {
-      const result = await runAgentTask({ config, catalog, session, store, roots, workspace, question: questioner.ask, yes: options.yes, onOutput: (text) => stdout.write(`${text}\n`) })
-      if (result.final) stdout.write(`${result.final}\n`)
-    }
-  }
+  const resumed = await resumeInteractiveSession({
+    options,
+    config,
+    catalog,
+    session,
+    store,
+    roots,
+    workspace,
+    questioner,
+    recovered,
+  })
+  if (options.continuing && session.pendingQuestion && !resumed) return
   while (true) {
     const input = await questioner.ask(`\n${color("Вы")} > `)
     if (!input) { if (!stdin.isTTY) break; continue }
@@ -835,6 +878,9 @@ export async function runCli(args = process.argv.slice(2)) {
   }
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1] || "").href) {
+const invokedPath = process.argv[1]
+  ? await realpath(process.argv[1]).catch(() => resolve(process.argv[1]))
+  : null
+if (invokedPath && invokedPath === fileURLToPath(import.meta.url)) {
   runCli().catch((error) => reportError(error, process.argv.includes("--json")))
 }

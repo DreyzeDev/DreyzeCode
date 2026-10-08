@@ -9,7 +9,7 @@ on the computer where the CLI runs.
 Requires Node.js 20 or newer.
 
 ```sh
-npm install -g @dreyzeai/dreyzecode
+npm install -g git+https://github.com/DreyzeDev/DreyzeCode.git
 dreyzecode login
 cd path/to/project
 dreyzecode
