@@ -25,3 +25,6 @@ jobs:
       - run: npm run check
       - run: npm test
       - run: npm pack --dry-run
+      - run: npm install -g .
+      - run: dreyzecode --version
+      - run: dreyzecode --help
