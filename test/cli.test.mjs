@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url"
 import {
   createSessionStore,
   apiGet,
+  buildSkillPrompt,
   completeSlashInput,
   executeTool,
   fetchModelCatalog,
@@ -48,6 +49,7 @@ test("parses the product command surface with global flags before and after comm
 
 test("parses DreyzeCode slash commands with multiword arguments and literal slash escape", () => {
   assert.deepEqual(parseSlashCommand("/MoDe plan"), { name: "mode", argument: "plan" })
+  assert.deepEqual(parseSlashCommand("/проверка текст задачи"), { name: "проверка", argument: "текст задачи" })
   assert.deepEqual(parseSlashCommand('/model "Dreyze Opus 5.5"'), { name: "model", argument: '"Dreyze Opus 5.5"' })
   assert.equal(parseSlashCommand("//tmp/project"), null)
   assert.equal(parseSlashCommand("Build a storefront"), null)
@@ -61,8 +63,13 @@ test("opens the slash command palette when the prompt contains only a slash", ()
 })
 
 test("completes slash commands and their mode, theme, and model arguments", () => {
-  const catalog = { models: [{ id: "dreyze/opus" }, { id: "dreyze/sonnet" }] }
+  const catalog = {
+    models: [{ id: "dreyze/opus" }, { id: "dreyze/sonnet" }],
+    skills: [{ commandName: "interface-review", name: "Interface Review" }, { commandName: "проверка", name: "Проверка" }],
+  }
   assert.deepEqual(completeSlashInput("/hel"), [["/help"], "/hel"])
+  assert.deepEqual(completeSlashInput("/interface", catalog), [["/interface-review"], "/interface"])
+  assert.deepEqual(completeSlashInput("/пров", catalog), [["/проверка"], "/пров"])
   assert.deepEqual(completeSlashInput("/mode p"), [["/mode plan"], "/mode p"])
   assert.deepEqual(completeSlashInput("/theme b"), [["/theme blue"], "/theme b"])
   assert.deepEqual(completeSlashInput("/model dreyze/o", catalog), [["/model dreyze/opus"], "/model dreyze/o"])
@@ -415,15 +422,46 @@ test("discovers project skills from their safe metadata without loading skill bo
   assert.deepEqual(skills, [
     {
       name: "Interface Review",
+      commandName: "interface-review",
       path: "./.dreyze/skills/interface-review/SKILL.md",
       description: "Review layout, responsive behavior, and accessibility.",
     },
     {
       name: "Release Checklist",
+      commandName: "release",
       path: "./.dreyze/skills/release/SKILL.md",
       description: "Check release gates before publishing.",
     },
   ])
+})
+
+test("loads a selected skill body locally for its slash command and user task", async (t) => {
+  const { workspace } = await fixture(t)
+  const skillDirectory = path.join(workspace, ".dreyze", "skills", "проверка-проекта")
+  await mkdir(skillDirectory, { recursive: true })
+  await writeFile(path.join(skillDirectory, "SKILL.md"), [
+    "---",
+    "name: Project Review",
+    "description: Review the project structure.",
+    "---",
+    "",
+    "Inspect the project and report concrete findings.",
+  ].join("\n"))
+
+  const [skill] = await loadProjectSkills([workspace])
+  assert.equal(skill.commandName, "проверка-проекта")
+  const prompt = await buildSkillPrompt(skill, [workspace], "Найди важные проблемы")
+  assert.match(prompt, /Inspect the project and report concrete findings\./u)
+  assert.match(prompt, /Найди важные проблемы/u)
+  assert.doesNotMatch(prompt, /description: Review the project structure/u)
+})
+
+test("refuses a slash skill path outside the selected workspace", async (t) => {
+  const { workspace } = await fixture(t)
+  await assert.rejects(
+    buildSkillPrompt({ name: "Unsafe", path: "./../outside/SKILL.md" }, [workspace]),
+    /вне папок/u,
+  )
 })
 
 test("lists workspace skills without requiring a Dreyze login", async (t) => {
@@ -440,6 +478,7 @@ test("lists workspace skills without requiring a Dreyze login", async (t) => {
   assert.equal(child.status, 0, child.stderr)
   assert.deepEqual(JSON.parse(child.stdout).skills, [{
     name: "Release",
+    commandName: "release",
     path: "./.dreyze/skills/release/SKILL.md",
     description: "Release checklist.",
   }])
@@ -856,7 +895,7 @@ test("runs the CLI when invoked through the symlink npm creates for its binary",
   await symlink(cli, command, "file")
   const child = spawnSync(command, ["--version"], { encoding: "utf8" })
   assert.equal(child.status, 0, child.stderr)
-  assert.equal(child.stdout, "DreyzeCode 0.5.8\n")
+  assert.equal(child.stdout, "DreyzeCode 0.5.9\n")
 })
 
 test("help documents image input in both one-shot and interactive modes", async () => {
@@ -865,6 +904,8 @@ test("help documents image input in both one-shot and interactive modes", async 
   assert.equal(child.status, 0, child.stderr)
   assert.match(child.stdout, /--image PATH/u)
   assert.match(child.stdout, /\/help.*\/attach/u)
+  assert.match(child.stdout, /\/skills/u)
+  assert.match(child.stdout, /<имя-папки>/u)
   assert.match(child.stdout, /skills list/u)
 })
 

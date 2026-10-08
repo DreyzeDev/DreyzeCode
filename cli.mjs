@@ -9,7 +9,7 @@ import { access, chmod, copyFile, lstat, mkdir, open, readdir, readFile, realpat
 import { fileURLToPath } from "node:url"
 import { connectMcpServers, listConfiguredMcpServers } from "./mcp-client.mjs"
 
-export const VERSION = "0.5.8"
+export const VERSION = "0.5.9"
 const MAX_STEPS = 80
 const MAX_HISTORY = 40
 const MAX_MESSAGE_CHARS = 24_000
@@ -31,6 +31,7 @@ export const SLASH_COMMANDS = Object.freeze([
   { name: "help", usage: "/help", description: "показать команды" },
   { name: "mode", usage: "/mode build|plan", description: "переключить режим работы" },
   { name: "model", usage: "/model [название]", description: "выбрать модель или показать каталог" },
+  { name: "skills", usage: "/skills", description: "показать доступные skills проекта" },
   { name: "attach", usage: "/attach <путь>", description: "добавить изображение к следующему сообщению" },
   { name: "detach", usage: "/detach", description: "убрать вложения следующего сообщения" },
   { name: "theme", usage: "/theme purple|blue|system", description: "изменить оформление терминала" },
@@ -154,7 +155,7 @@ export function parseSlashCommand(input) {
   if (typeof input !== "string") return null
   const trimmed = input.trim()
   if (!trimmed.startsWith("/") || trimmed.startsWith("//")) return null
-  const match = /^\/([a-z][a-z0-9-]*)(?:\s+([\s\S]*))?$/iu.exec(trimmed)
+  const match = /^\/([\p{L}][\p{L}\p{N}-]*)(?:\s+([\s\S]*))?$/iu.exec(trimmed)
   if (!match) return null
   return { name: match[1].toLowerCase(), argument: match[2] ?? "" }
 }
@@ -163,10 +164,35 @@ export function isSlashCommandPalette(input) {
   return typeof input === "string" && input.trim() === "/"
 }
 
+export async function buildSkillPrompt(skill, roots, request = "") {
+  if (!skill || typeof skill.path !== "string" || !Array.isArray(roots) || !roots.length) {
+    throw new Error("Не удалось загрузить инструкции выбранного skill.")
+  }
+  const addDirectoryMatch = /^--add-dir\s+(\d+)\/(.+)$/u.exec(skill.path)
+  const projectMatch = /^\.\/(.+)$/u.exec(skill.path)
+  const rootIndex = addDirectoryMatch ? Number(addDirectoryMatch[1]) - 1 : 0
+  const relativePath = addDirectoryMatch?.[2] ?? projectMatch?.[1]
+  if (!relativePath || !roots[rootIndex]) throw new Error("Путь к skill находится вне разрешённых папок.")
+  const pathname = await resolveWorkspacePath(resolve(roots[rootIndex], relativePath), roots, { mustExist: true })
+  const info = await lstat(pathname)
+  if (!info.isFile() || info.isSymbolicLink() || info.size < 1 || info.size > MAX_PROJECT_INSTRUCTION_FILE_BYTES) {
+    throw new Error("Файл выбранного skill пуст, слишком велик или недоступен.")
+  }
+  const rawBody = (await readFile(pathname, "utf8")).replace(/^\uFEFF/u, "")
+  const skillBody = rawBody.replace(/^---\s*\r?\n[\s\S]*?\r?\n---\s*(?:\r?\n|$)/u, "")
+  const body = redactSecrets(skillBody).slice(0, MAX_PROJECT_SKILL_CHARS)
+  if (!body.trim()) throw new Error("Файл выбранного skill не содержит инструкций.")
+  const task = typeof request === "string" ? request.trim() : ""
+  return `Примени проектный skill «${skill.name}» и выполни задачу по его инструкциям.\n\nИнструкции skill:\n---\n${body}\n---\n\nЗадача пользователя:\n${task || "Примени эти инструкции к текущему проекту."}`
+}
+
 export function completeSlashInput(line, catalog = { models: [] }) {
   if (typeof line !== "string" || !line.startsWith("/") || line.startsWith("//")) return [[], line]
   const match = /^\/([a-z][a-z0-9-]*)(?:\s+([\s\S]*))?$/iu.exec(line)
-  const names = [...SLASH_COMMANDS.map(({ name }) => `/${name}`), "/models", "/quit"]
+  const skillNames = Array.isArray(catalog?.skills)
+    ? catalog.skills.map((skill) => skill?.commandName ?? skill?.name).filter((name) => typeof name === "string" && /^\p{L}[\p{L}\p{N}-]*$/iu.test(name))
+    : []
+  const names = [...new Set([...SLASH_COMMANDS.map(({ name }) => `/${name}`), ...skillNames.map((name) => `/${name}`), "/models", "/quit"])]
   if (!match || match[2] === undefined) {
     return [names.filter((candidate) => candidate.toLowerCase().startsWith(line.toLowerCase())), line]
   }
@@ -287,8 +313,9 @@ function printHelp() {
     `  dreyzecode api get /api/...            безопасный GET к API Dreyze\n\n` +
     `Параметры: --model ID, --mode build|plan, --add-dir PATH, --image PATH (повторяемый), --session ID, --json, --yes\n` +
     `В Build изменения файлов и команды требуют подтверждения. Plan разрешает только чтение.\n` +
-    `В интерактивном режиме: / открывает команды; Tab дополняет команды и модели.\n` +
-    `Команды: /help, /mode, /model, /attach, /detach, /theme, /status, /sessions, /resume, /new, /clear, /exit.\n`)
+    `В интерактивном режиме: / открывает команды; Tab дополняет команды, skills и модели.\n` +
+    `Команды: /help, /skills, /mode, /model, /attach, /detach, /theme, /status, /sessions, /resume, /new, /clear, /exit.\n` +
+    `Проектный skill запускается как /<имя-папки> задача.\n`)
 }
 
 function jsonOut(value) {
@@ -953,10 +980,11 @@ async function approveMcpTool(action, mcp, { yes, question }) {
 
 export async function runAgentTask({ config, catalog, session, store, roots, workspace, question, yes = false, fetchImpl = fetch, onOutput = () => {}, onActivity = () => () => {} }) {
   await recoverPendingAction(session, store)
-  const [projectInstructions, projectSkills] = await Promise.all([
+  const [projectInstructions, discoveredSkills] = await Promise.all([
     loadProjectInstructions(roots),
     loadProjectSkills(roots),
   ])
+  const projectSkills = discoveredSkills.map(({ commandName, ...skill }) => skill)
   const mcp = session.mode === "build"
     ? await connectMcpServers({
       roots,
@@ -1147,6 +1175,7 @@ export async function loadProjectSkills(roots) {
   const skills = []
   let remaining = MAX_PROJECT_SKILL_CHARS
   const seen = new Set()
+  const seenNames = new Set()
   for (const root of roots) {
     if (skills.length >= MAX_PROJECT_SKILLS || remaining <= 0) break
     const candidateRoot = join(root, ".dreyze", "skills")
@@ -1190,19 +1219,22 @@ export async function loadProjectSkills(roots) {
         if (value.startsWith("'") && value.endsWith("'")) return value.slice(1, -1).replace(/''/gu, "'")
         return value
       }
-      const name = redactSecrets(scalar("name") || entry.name).slice(0, 80)
+      const name = redactSecrets(scalar("name") || entry.name).trim().slice(0, 80)
+      const commandName = entry.name.normalize("NFC").toLowerCase().replace(/[^\p{L}\p{N}-]+/gu, "-").replace(/^-+|-+$/gu, "").slice(0, 80)
+      if (!name || !/^\p{L}[\p{L}\p{N}-]{0,79}$/u.test(commandName) || SLASH_COMMAND_NAMES.has(commandName) || seenNames.has(commandName)) continue
       const description = redactSecrets(scalar("description")).slice(0, 800)
       const rootLabel = roots.indexOf(root) === 0 ? "." : `--add-dir ${roots.indexOf(root) + 1}`
       const path = relative(root, canonicalFile).split(sep).join("/")
-      const skill = { name, path: `${rootLabel}/${path}`, description }
-      const size = skill.name.length + skill.path.length + skill.description.length
+      const skill = { name, commandName, path: `${rootLabel}/${path}`, description }
+      const size = skill.name.length + skill.commandName.length + skill.path.length + skill.description.length
       if (size > remaining) {
-        const shortenedDescription = skill.description.slice(0, Math.max(0, remaining - skill.name.length - skill.path.length))
+        const shortenedDescription = skill.description.slice(0, Math.max(0, remaining - skill.name.length - skill.commandName.length - skill.path.length))
         skill.description = shortenedDescription
       }
-      const finalSize = skill.name.length + skill.path.length + skill.description.length
+      const finalSize = skill.name.length + skill.commandName.length + skill.path.length + skill.description.length
       if (!finalSize || finalSize > remaining) continue
       seen.add(canonicalFile)
+      seenNames.add(commandName)
       skills.push(skill)
       remaining -= finalSize
     }
@@ -1268,10 +1300,11 @@ function writeChatMessage(title, content, color = (text) => text) {
   stdout.write(`\n${color(panel[0])}\n${panel.slice(1, -1).join("\n")}\n${color(panel.at(-1))}\n`)
 }
 
-function printSlashHelp(color) {
+function printSlashHelp(color, skills = []) {
   const rows = SLASH_COMMANDS.map(({ usage, description }) => `${usage.padEnd(25)} ${description}`)
+  for (const skill of skills) rows.push(`/${skill.commandName} · ${skill.name}\n  ${skill.description || "проектный skill"}`)
   rows.push(`${"//текст".padEnd(25)} отправить модели текст, начинающийся с /`)
-  rows.push("", "Tab — дополнить команду, режим, тему или модель.", "Enter — отправить задачу · / — снова открыть список.")
+  rows.push("", "Tab — дополнить команду, skill, режим, тему или модель.", "Enter — отправить задачу · / — снова открыть список.")
   writeChatMessage("Команды DreyzeCode · свои команды", rows.join("\n"), color)
 }
 
@@ -1427,7 +1460,7 @@ async function interactive(options, config, catalog, initialSession, store, root
     const input = await questioner.ask(`\n${color("›")} `)
     if (!input) { if (!stdin.isTTY) break; continue }
     if (isSlashCommandPalette(input)) {
-      printSlashHelp(color)
+      printSlashHelp(color, catalog.skills)
       continue
     }
     const parsedCommand = parseSlashCommand(input)
@@ -1435,12 +1468,30 @@ async function interactive(options, config, catalog, initialSession, store, root
       const { name, argument } = parsedCommand
       const value = argument.trim()
       if (!SLASH_COMMAND_NAMES.has(name)) {
-        writeChatMessage("Неизвестная команда", `/${name} не найдена. Введите /help, чтобы посмотреть команды DreyzeCode.`, color)
+        const skill = catalog.skills?.find((item) => item.commandName === name)
+        if (!skill) {
+          writeChatMessage("Неизвестная команда", `/${name} не найдена. Введите /help, чтобы посмотреть команды DreyzeCode.`, color)
+          continue
+        }
+        try {
+          const skillPrompt = await buildSkillPrompt(skill, roots, value)
+          writeChatMessage(`Skill · /${skill.name}`, skill.description || "Применяю инструкции этого проекта.", color)
+          writeChatMessage("Вы", value || `Применить /${skill.name} к проекту`, color)
+          await runPrompt(skillPrompt, { ...options, imagePaths: pendingImagePaths, chatColor: color }, config, catalog, session, store, roots, workspace, questioner)
+          pendingImagePaths = []
+        } catch (error) {
+          writeChatMessage("Ошибка skill", error instanceof Error ? error.message : "Не удалось применить skill.", color)
+        }
         continue
       }
       if (name === "exit" || name === "quit") break
       if (name === "help") {
-        printSlashHelp(color)
+        printSlashHelp(color, catalog.skills)
+        continue
+      }
+      if (name === "skills") {
+        const rows = (catalog.skills ?? []).map((skill) => `/${skill.commandName} · ${skill.name}\n  ${skill.description || "проектный skill"}`)
+        writeChatMessage("Skills проекта", rows.join("\n") || "В разрешённых папках проекта skills не найдены.", color)
         continue
       }
       if (name === "mode") {
@@ -1618,19 +1669,20 @@ export async function runCli(args = process.argv.slice(2)) {
     return
   }
   const roots = await canonicalRoots(workspace, options.addDirs)
+  const interactiveCatalog = { ...catalog, skills: await loadProjectSkills(roots) }
   const store = createSessionStore(workspace)
-  const session = await sessionFor(options, store, catalog)
+  const session = await sessionFor(options, store, interactiveCatalog)
   if (options.model && !catalog.models.some((model) => model.id === options.model || model.name.toLowerCase() === options.model.toLowerCase())) {
     throw new Error(`Модель «${options.model}» отсутствует в каталоге Dreyze.`)
   }
   if (options.model) session.model = catalog.models.find((model) => model.id === options.model || model.name.toLowerCase() === options.model.toLowerCase()).id
   if (options.mode) session.mode = options.mode
-  const questioner = promptInterface(options.json, catalog)
+  const questioner = promptInterface(options.json, interactiveCatalog)
   try {
     if (options.command === "run" || options.positionals.length > 0) {
-      return await runPrompt(options.positionals.join(" "), options, config, catalog, session, store, roots, workspace, questioner)
+      return await runPrompt(options.positionals.join(" "), options, config, interactiveCatalog, session, store, roots, workspace, questioner)
     }
-    return await interactive(options, config, catalog, session, store, roots, workspace, questioner)
+    return await interactive(options, config, interactiveCatalog, session, store, roots, workspace, questioner)
   } finally {
     questioner.close()
   }

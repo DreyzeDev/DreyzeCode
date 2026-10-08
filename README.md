@@ -58,11 +58,12 @@ each time they are sent. Each image is limited to 2.9 MB and a message to 7 MB
 total.
 
 Interactive mode renders sent prompts and model replies in separate chat
-panels. A live status shows when the model or a local tool is working. Enter `/` to open the command palette or press Tab to complete commands,
-modes, themes, and available models. `/help` lists the DreyzeCode commands:
-`/model`, `/mode`, `/attach`, `/detach`, `/theme`, `/status`, `/sessions`,
-`/resume`, `/new`, `/clear`, and `/exit`. Prefix a message with `//` when it
-should start with a literal `/`.
+panels. A live status shows when the model or a local tool is working. Enter `/`
+to open the command palette or press Tab to complete commands, project skills,
+modes, themes, and available models. `/help` lists the built-in commands and
+project skills. Use `/skill-name task` to run a project skill with a task, or
+`/skills` to list skills. Prefix a message with `//` when it should start with
+a literal `/`.
 
 The agent follows project guidance from `AGENTS.md` files and
 `.dreyze/instructions.md`. Nested `AGENTS.md` files are supplied with their
@@ -73,9 +74,12 @@ characters.
 
 Project skills live at `.dreyze/skills/<name>/SKILL.md`. Add YAML frontmatter
 with `name` and `description`; DreyzeCode sends that small index with each
-agent turn, then the model reads a matching skill file before using it.
-`dreyzecode skills list` displays skills without requiring login. Additional
-approved project folders can contain their own `.dreyze/skills` directory.
+agent turn. The folder name becomes the slash command (for example,
+`.dreyze/skills/interface-review/SKILL.md` is `/interface-review`). Running a
+skill command reads its instructions from the workspace and combines them with
+your task. `dreyzecode skills list` displays aliases without requiring login.
+Additional approved project folders can contain their own `.dreyze/skills`
+directory.
 
 ## MCP servers
 
