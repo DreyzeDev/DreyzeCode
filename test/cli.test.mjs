@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises"
+import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { spawnSync } from "node:child_process"
@@ -21,9 +21,10 @@ import {
 
 async function fixture(t) {
   const root = await mkdtemp(path.join(os.tmpdir(), "dreyzecode-native-"))
-  const workspace = path.join(root, "project")
+  const workspacePath = path.join(root, "project")
   const config = path.join(root, "config")
-  await mkdir(workspace)
+  await mkdir(workspacePath)
+  const workspace = await realpath(workspacePath)
   t.after(() => rm(root, { recursive: true, force: true }))
   return { root, workspace, config }
 }
