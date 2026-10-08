@@ -515,6 +515,34 @@ test("keeps a task's project guide and skill snapshot stable across tool turns",
   assert.ok(session.messages.some((message) => message.content.includes("File created")))
 })
 
+test("trims only the oldest session messages needed to stay within the history budget", async (t) => {
+  const { workspace, config } = await fixture(t)
+  const store = createSessionStore(workspace, config)
+  const session = await store.create("dreyze/test-model", "build")
+  session.messages = Array.from({ length: 10 }, (_, index) => ({
+    role: index % 2 === 0 ? "user" : "assistant",
+    content: `message-${index} ${"x".repeat(20_000)}`,
+  }))
+  const result = await runAgentTask({
+    config: { url: "https://moonfacet.example", cookie: "session" },
+    catalog: { models: [], defaultModel: "dreyze/test-model" },
+    session,
+    store,
+    roots: [workspace],
+    workspace,
+    question: async () => "",
+    onOutput: () => {},
+    fetchImpl: async () => Response.json({ type: "final", content: "Done." }),
+  })
+
+  assert.equal(result.final, "Done.")
+  assert.equal(session.messages[0].content.slice(0, 8), "message-")
+  assert.equal(session.messages.at(-1).content, "Done.")
+  assert.ok(session.messages.length > 2)
+  assert.ok(session.messages.reduce((sum, message) => sum + message.content.length, 0) <= 130_000)
+  assert.equal(session.messages.some((message) => message.content.startsWith("message-9 ")), true)
+})
+
 test("does not execute a duplicate tool action and lets the model recover", async (t) => {
   const { workspace, config } = await fixture(t)
   const store = createSessionStore(workspace, config)
@@ -722,7 +750,7 @@ test("runs the CLI when invoked through the symlink npm creates for its binary",
   await symlink(cli, command, "file")
   const child = spawnSync(command, ["--version"], { encoding: "utf8" })
   assert.equal(child.status, 0, child.stderr)
-  assert.equal(child.stdout, "DreyzeCode 0.5.2\n")
+  assert.equal(child.stdout, "DreyzeCode 0.5.3\n")
 })
 
 test("help documents image input in both one-shot and interactive modes", async () => {

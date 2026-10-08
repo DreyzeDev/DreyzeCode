@@ -9,7 +9,7 @@ import { access, chmod, copyFile, lstat, mkdir, open, readdir, readFile, realpat
 import { fileURLToPath } from "node:url"
 import { connectMcpServers, listConfiguredMcpServers } from "./mcp-client.mjs"
 
-export const VERSION = "0.5.2"
+export const VERSION = "0.5.3"
 const MAX_STEPS = 80
 const MAX_HISTORY = 40
 const MAX_MESSAGE_CHARS = 24_000
@@ -364,8 +364,11 @@ function appendMessage(session, role, content, imagePaths = []) {
   const safe = String(content).slice(0, MAX_MESSAGE_CHARS)
   session.messages.push({ role, content: safe, ...(role === "user" && imagePaths.length ? { imagePaths } : {}) })
   if (session.messages.length > MAX_HISTORY) session.messages.splice(1, session.messages.length - MAX_HISTORY)
-  const total = session.messages.reduce((sum, item) => sum + item.content.length, 0)
-  while (total > 130_000 && session.messages.length > 2) session.messages.splice(1, 1)
+  let total = session.messages.reduce((sum, item) => sum + item.content.length, 0)
+  while (total > 130_000 && session.messages.length > 2) {
+    const [removed] = session.messages.splice(1, 1)
+    total -= removed.content.length
+  }
 }
 
 export async function recoverPendingAction(session, store) {

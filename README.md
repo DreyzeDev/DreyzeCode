@@ -105,7 +105,9 @@ Plan mode does not expose MCP tools.
 Sessions are stored under the user's DreyzeCode configuration directory, keyed
 by the canonical project path. An interrupted write or command is recorded
 before it starts. On restart the CLI reports an unknown outcome and asks the
-model to inspect the current state before attempting the action again.
+model to inspect the current state before attempting the action again. When a
+session grows beyond 130,000 characters, the oldest conversation entries are
+trimmed while keeping the original request and the most recent context.
 
 ## Machine-readable output
 
