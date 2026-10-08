@@ -9,7 +9,7 @@ import { access, chmod, copyFile, lstat, mkdir, open, readdir, readFile, realpat
 import { fileURLToPath } from "node:url"
 import { connectMcpServers, listConfiguredMcpServers } from "./mcp-client.mjs"
 
-export const VERSION = "0.5.11"
+export const VERSION = "0.5.12"
 const MAX_STEPS = 80
 const MAX_HISTORY = 40
 const MAX_MESSAGE_CHARS = 24_000
@@ -212,8 +212,51 @@ export function completeSlashInput(line, catalog = { models: [] }) {
   return [candidates, line]
 }
 
+export function slashTabCompletion(line, catalog = { models: [] }) {
+  if (typeof line !== "string") return ""
+  const [candidates] = completeSlashInput(line, catalog)
+  if (!candidates.length) return ""
+  let common = candidates[0]
+  for (const candidate of candidates.slice(1)) {
+    let index = 0
+    while (index < common.length && index < candidate.length && common[index].toLowerCase() === candidate[index].toLowerCase()) index++
+    common = common.slice(0, index)
+  }
+  return common.length > line.length ? common.slice(line.length) : ""
+}
+
 export function slashCommandSuggestions(line, catalog = { models: [], skills: [] }) {
-  if (typeof line !== "string" || !line.startsWith("/") || line.startsWith("//") || /\s/u.test(line.slice(1))) return []
+  if (typeof line !== "string" || !line.startsWith("/") || line.startsWith("//")) return []
+  const argumentMatch = /^\/([\p{L}][\p{L}\p{N}-]*)\s+([^\s]*)$/iu.exec(line)
+  if (argumentMatch) {
+    const [, commandName, typedValue] = argumentMatch
+    const name = commandName.toLowerCase()
+    const choices = name === "mode"
+      ? [
+          { value: "build", description: "выполнение задач с подтверждением изменений" },
+          { value: "plan", description: "анализ проекта без изменений" },
+        ]
+      : name === "theme"
+        ? [
+            { value: "purple", description: "фиолетовая тема" },
+            { value: "blue", description: "синяя тема" },
+            { value: "system", description: "без цвета" },
+          ]
+        : name === "model" || name === "models"
+          ? (Array.isArray(catalog?.models) ? catalog.models.flatMap((model) => typeof model?.id === "string"
+              ? [{ value: model.id, description: model.name || model.id }]
+              : []) : [])
+          : []
+    return choices
+      .filter(({ value }) => value.toLowerCase().startsWith(typedValue.toLowerCase()))
+      .slice(0, 7)
+      .map(({ value, description }) => ({
+        name: `${name} ${value}`,
+        usage: `/${name} ${value}`,
+        description,
+      }))
+  }
+  if (/\s/u.test(line.slice(1))) return []
   const commands = [
     ...SLASH_COMMANDS.map(({ name, usage, description }) => ({ name, usage, description })),
     { name: "models", usage: "/models", description: "показать доступные модели" },
@@ -318,6 +361,16 @@ export function formatChatMessage(title, content, requestedWidth = 76) {
   })
   const lines = wrapped.map((line) => `│ ${line}${" ".repeat(Math.max(0, contentWidth - terminalCellWidth(line)))} │`)
   return [header, ...lines, `╰${"─".repeat(width - 2)}╯`].join("\n")
+}
+
+export function formatChatComposer(requestedWidth = 76) {
+  const frame = formatChatMessage("Новое сообщение", "Enter — отправить · / — команды · Tab — дополнить", requestedWidth).split("\n")
+  return {
+    hint: frame.slice(1, -1).join("\n"),
+    header: frame[0],
+    prompt: "│ › ",
+    footer: frame.at(-1),
+  }
 }
 
 function printHelp() {
@@ -1280,6 +1333,7 @@ function promptInterface(jsonMode = false, catalog = { models: [] }) {
   let paletteVisible = false
   let paletteAnchorRow = 0
   let paletteColor = (text) => text
+  let paletteRenderTimer = null
 
   const moveToPalette = () => {
     const position = rl.getCursorPos()
@@ -1305,6 +1359,7 @@ function promptInterface(jsonMode = false, catalog = { models: [] }) {
     const shown = suggestions.slice(0, 7)
     const rows = shown.map(({ usage, description }) => `${usage.padEnd(24)} ${description}`)
     if (suggestions.length > shown.length) rows.push(`… ещё ${suggestions.length - shown.length} команд · Tab — дополнить`)
+    else if (suggestions.length) rows.push("Tab — дополнить · Enter / — полный список")
     const width = Math.max(32, Math.min(76, Number(output.columns) || 76))
     const panel = formatChatMessage("Команды DreyzeCode", rows.join("\n"), width).split("\n")
     const position = rl.getCursorPos()
@@ -1314,12 +1369,30 @@ function promptInterface(jsonMode = false, catalog = { models: [] }) {
   }
 
   const onKeypress = (_character, key) => {
-    setImmediate(() => {
+    if (key?.name === "return" || key?.name === "enter") return
+    if (key?.name === "tab" && promptActive) {
+      const tabWasInserted = rl.line.endsWith("\t") && rl.cursor === rl.line.length
+      const lineBeforeCompletion = tabWasInserted ? rl.line.slice(0, -1) : rl.line
+      const slashInput = lineBeforeCompletion.startsWith("/") && !lineBeforeCompletion.startsWith("//")
+      const completion = rl.cursor === rl.line.length ? slashTabCompletion(lineBeforeCompletion, catalog) : ""
+      if (slashInput && (tabWasInserted || completion)) {
+        setImmediate(() => {
+          if (!promptActive || rl.line !== (tabWasInserted ? `${lineBeforeCompletion}\t` : lineBeforeCompletion)) return
+          if (tabWasInserted) {
+            rl.line = lineBeforeCompletion
+            rl.cursor = lineBeforeCompletion.length
+            rl._refreshLine?.()
+          }
+          if (completion) rl.write(completion)
+        })
+      }
+    }
+    clearTimeout(paletteRenderTimer)
+    paletteRenderTimer = setTimeout(() => {
       if (!promptActive) return
-      if (key?.name === "return" || key?.name === "enter") return
       clearPalette()
       drawPalette()
-    })
+    }, 20)
   }
   if (stdin.isTTY && output.isTTY) stdin.on("keypress", onKeypress)
 
@@ -1329,13 +1402,28 @@ function promptInterface(jsonMode = false, catalog = { models: [] }) {
       promptActive = true
       rl.question(prompt, (answer) => {
         promptActive = false
+        clearTimeout(paletteRenderTimer)
         clearPalette(true)
+        resolvePromise(answer)
+      })
+    }),
+    askChat: (color = (text) => text) => new Promise((resolvePromise) => {
+      if (!stdin.isTTY) return resolvePromise(null)
+      const composer = formatChatComposer(Number(output.columns) || 76)
+      promptActive = true
+      output.write(`\n${color(composer.header)}\n${color(composer.hint)}\n`)
+      rl.question(composer.prompt, (answer) => {
+        promptActive = false
+        clearTimeout(paletteRenderTimer)
+        clearPalette(true)
+        output.write(`${color(composer.footer)}\n`)
         resolvePromise(answer)
       })
     }),
     setPaletteColor: (color) => { paletteColor = color },
     close: () => {
       promptActive = false
+      clearTimeout(paletteRenderTimer)
       clearPalette()
       stdin.removeListener("keypress", onKeypress)
       rl.close()
@@ -1381,14 +1469,22 @@ function accent(value) {
 
 function writeChatMessage(title, content, color = (text) => text) {
   const panel = formatChatMessage(title, content, stdout.columns || 76).split("\n")
-  stdout.write(`\n${color(panel[0])}\n${panel.slice(1, -1).join("\n")}\n${color(panel.at(-1))}\n`)
+  const titleText = String(title)
+  const headerColor = titleText === "Вы"
+    ? stdout.isTTY && env.NO_COLOR === undefined
+      ? (text) => `\u001b[96m${text}\u001b[0m`
+      : color
+    : /ошибка/iu.test(titleText) && stdout.isTTY && env.NO_COLOR === undefined
+      ? (text) => `\u001b[91m${text}\u001b[0m`
+      : color
+  stdout.write(`\n${headerColor(panel[0])}\n${panel.slice(1, -1).join("\n")}\n${headerColor(panel.at(-1))}\n`)
 }
 
 function printSlashHelp(color, skills = []) {
   const rows = SLASH_COMMANDS.map(({ usage, description }) => `${usage.padEnd(25)} ${description}`)
-  for (const skill of skills) rows.push(`/${skill.commandName} · ${skill.name}\n  ${skill.description || "проектный skill"}`)
+  for (const skill of skills) rows.push(`/${skill.commandName} · ${skill.name}\n  ${skill.description || "команда проекта"}`)
   rows.push(`${"//текст".padEnd(25)} отправить модели текст, начинающийся с /`)
-  rows.push("", "Tab — дополнить команду, skill, режим, тему или модель.", "Enter — отправить задачу · / — снова открыть список.")
+  rows.push("", "Tab — дополнить команду, режим, тему или модель.", "Enter — отправить задачу · / — снова открыть список.")
   writeChatMessage("Команды DreyzeCode · свои команды", rows.join("\n"), color)
 }
 
@@ -1520,7 +1616,6 @@ async function interactive(options, config, catalog, initialSession, store, root
   const printSessionHeader = () => {
     const mode = session.mode === "plan" ? "Plan · только чтение" : "Build · изменения с подтверждением"
     writeChatMessage("DreyzeCode", `Проект: ${workspace}\nМодель: ${session.model}\nРежим: ${mode}`, color)
-    stdout.write("Сообщение отправляется по Enter · подсказки команд появляются при вводе / · Tab дополняет.\n")
   }
   const printModels = () => {
     const rows = catalog.models.map((model) => `${model.id === session.model ? "●" : "○"} ${model.name} · ${model.id}${model.supportsImages ? " · images" : ""}`)
@@ -1542,7 +1637,7 @@ async function interactive(options, config, catalog, initialSession, store, root
   })
   if (options.continuing && session.pendingQuestion && !resumed) return
   while (true) {
-    const input = await questioner.ask(`\n${color("›")} `)
+    const input = await questioner.askChat(color)
     if (!input) { if (!stdin.isTTY) break; continue }
     if (isSlashCommandPalette(input)) {
       printSlashHelp(color, catalog.skills)
@@ -1575,8 +1670,8 @@ async function interactive(options, config, catalog, initialSession, store, root
         continue
       }
       if (name === "skills") {
-        const rows = (catalog.skills ?? []).map((skill) => `/${skill.commandName} · ${skill.name}\n  ${skill.description || "проектный skill"}`)
-        writeChatMessage("Skills проекта", rows.join("\n") || "В разрешённых папках проекта skills не найдены.", color)
+        const rows = (catalog.skills ?? []).map((skill) => `/${skill.commandName} · ${skill.name}\n  ${skill.description || "команда проекта"}`)
+        writeChatMessage("Команды проекта", rows.join("\n") || "В разрешённых папках проекта команды не найдены.", color)
         continue
       }
       if (name === "mode") {

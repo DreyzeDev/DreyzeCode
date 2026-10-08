@@ -13,6 +13,7 @@ import {
   executeTool,
   fetchModelCatalog,
   formatChatMessage,
+  formatChatComposer,
   isSlashCommandPalette,
   isSensitivePath,
   loadProjectInstructions,
@@ -24,6 +25,7 @@ import {
   resumeInteractiveSession,
   resolveWorkspacePath,
   runAgentTask,
+  slashTabCompletion,
   slashCommandSuggestions,
   validateImagePaths,
 } from "../cli.mjs"
@@ -75,6 +77,9 @@ test("completes slash commands and their mode, theme, and model arguments", () =
   assert.deepEqual(completeSlashInput("/theme b"), [["/theme blue"], "/theme b"])
   assert.deepEqual(completeSlashInput("/model dreyze/o", catalog), [["/model dreyze/opus"], "/model dreyze/o"])
   assert.deepEqual(completeSlashInput("//tmp"), [[], "//tmp"])
+  assert.equal(slashTabCompletion("/hel", catalog), "p")
+  assert.equal(slashTabCompletion("/theme b", catalog), "lue")
+  assert.equal(slashTabCompletion("/mode ", catalog), "")
 })
 
 test("shows live slash suggestions for built-in commands and project skills", () => {
@@ -97,6 +102,14 @@ test("shows live slash suggestions for built-in commands and project skills", ()
   assert.deepEqual(slashCommandSuggestions("//tmp/project", catalog), [])
 })
 
+test("shows live choices for slash command arguments", () => {
+  const catalog = { models: [{ id: "dreyze/opus", name: "Dreyze Opus" }, { id: "dreyze/sonnet", name: "Dreyze Sonnet" }] }
+  assert.deepEqual(slashCommandSuggestions("/mode p", catalog).map(({ usage }) => usage), ["/mode plan"])
+  assert.deepEqual(slashCommandSuggestions("/theme ", catalog).map(({ usage }) => usage), ["/theme purple", "/theme blue", "/theme system"])
+  assert.deepEqual(slashCommandSuggestions("/model dreyze/o", catalog).map(({ usage }) => usage), ["/model dreyze/opus"])
+  assert.deepEqual(slashCommandSuggestions("/help later", catalog), [])
+})
+
 test("formats chat messages as terminal-safe panels", () => {
   const panel = formatChatMessage("DreyzeCode", "Hello\u001b[31m red\u001b[0m\nNext line", 40)
   const lines = panel.split("\n")
@@ -107,6 +120,17 @@ test("formats chat messages as terminal-safe panels", () => {
   assert.equal(lines[0].length, 40)
   assert.ok(lines.slice(1, -1).every((line) => line.length === 40))
   assert.equal(lines.at(-1).length, 40)
+})
+
+test("formats the interactive message composer within narrow and wide terminals", () => {
+  for (const width of [32, 40, 76]) {
+    const composer = formatChatComposer(width)
+    assert.match(composer.header, /^╭─ Новое сообщение/u)
+    assert.equal(composer.header.length, width)
+    assert.equal(composer.footer.length, width)
+    assert.equal(composer.prompt, "│ › ")
+    assert.match(composer.hint, /Enter — отправить/u)
+  }
 })
 
 test("wraps long chat output to the available terminal width", () => {
@@ -916,7 +940,7 @@ test("runs the CLI when invoked through the symlink npm creates for its binary",
   await symlink(cli, command, "file")
   const child = spawnSync(command, ["--version"], { encoding: "utf8" })
   assert.equal(child.status, 0, child.stderr)
-  assert.equal(child.stdout, "DreyzeCode 0.5.11\n")
+  assert.equal(child.stdout, "DreyzeCode 0.5.12\n")
 })
 
 test("help documents image input in both one-shot and interactive modes", async () => {
