@@ -122,10 +122,31 @@ test("connects to a confirmed stdio MCP server and redacts its configured secret
     const output = await registry.call(registry.tools[0].name, { query: "hello" })
     assert.match(output.output, /hello/u)
     assert.match(output.output, /\[SECRET OMITTED\]/u)
+    assert.match(output.output, /Bearer \[SECRET OMITTED\]/u)
+    assert.match(output.output, /cookie=\[SECRET OMITTED\]/u)
     assert.doesNotMatch(output.output, new RegExp(secret, "u"))
+    assert.doesNotMatch(output.output, /mcp-fixture-bearer-token|mcp-cookie-value/u)
   } finally {
     await registry.close()
   }
+})
+
+test("rejects project MCP working directories that escape through symlinks", async (t) => {
+  const { root, workspace } = await fixture(t)
+  const outside = path.join(root, "outside")
+  const linked = path.join(workspace, "linked")
+  await mkdir(outside)
+  await symlink(outside, linked, process.platform === "win32" ? "junction" : "dir")
+  await mkdir(path.join(workspace, ".dreyze"), { recursive: true })
+  await writeFile(path.join(workspace, ".dreyze", "mcp.json"), JSON.stringify({
+    mcpServers: {
+      escaped: { command: process.execPath, args: [], cwd: "linked" },
+    },
+  }))
+
+  const result = await listConfiguredMcpServers({ roots: [workspace], userConfigPath: path.join(root, "missing-mcp.json") })
+  assert.equal(result.servers.length, 0)
+  assert.match(result.issues.join("\n"), /внутри разрешённой папки/u)
 })
 
 test("routes agent MCP calls through server discovery and asks before invocation", async (t) => {
@@ -638,7 +659,7 @@ test("runs the CLI when invoked through the symlink npm creates for its binary",
   await symlink(cli, command, "file")
   const child = spawnSync(command, ["--version"], { encoding: "utf8" })
   assert.equal(child.status, 0, child.stderr)
-  assert.equal(child.stdout, "DreyzeCode 0.5.0\n")
+  assert.equal(child.stdout, "DreyzeCode 0.5.1\n")
 })
 
 test("help documents image input in both one-shot and interactive modes", async () => {

@@ -37,7 +37,7 @@ process.stdin.on("data", (chunk) => {
       result = {
         content: [{
           type: "text",
-          text: `${request.params.arguments.query}\n${process.env.MCP_ECHO_SECRET ?? "secret missing"}`,
+          text: `${request.params.arguments.query}\n${process.env.MCP_ECHO_SECRET ?? "secret missing"}\nBearer mcp-fixture-bearer-token-8675309\ncookie=mcp-cookie-value-995531`,
         }],
         isError: false,
       }

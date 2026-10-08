@@ -1,7 +1,7 @@
 import { Client, SSEClientTransport, StreamableHTTPClientTransport } from "@modelcontextprotocol/client"
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio"
 import { lstat, readFile, realpath, stat } from "node:fs/promises"
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 
 const MAX_CONFIG_BYTES = 64_000
 const MAX_SERVERS = 16
@@ -125,6 +125,20 @@ async function readConfigFile(pathname, label, scopedRoot) {
         }
         const cwd = raw.cwd === undefined ? baseDirectory : resolve(baseDirectory, raw.cwd)
         if (scopedRoot && !within(scopedRoot, cwd)) throw new Error("Рабочая папка MCP сервера должна находиться внутри разрешённой папки.")
+        let resolvedCwd
+        try { resolvedCwd = await realpath(cwd) } catch {
+          throw new Error("Рабочая папка MCP сервера не существует или недоступна.")
+        }
+        if (!(await stat(resolvedCwd)).isDirectory()) throw new Error("Рабочая папка MCP сервера должна быть папкой.")
+        if (scopedRoot) {
+          let resolvedRoot
+          try { resolvedRoot = await realpath(scopedRoot) } catch {
+            throw new Error("Разрешённая папка проекта недоступна.")
+          }
+          if (!within(resolvedRoot, resolvedCwd)) {
+            throw new Error("Рабочая папка MCP сервера должна находиться внутри разрешённой папки.")
+          }
+        }
         servers.push({
           name,
           label: `${label}/${name}`,
@@ -134,7 +148,7 @@ async function readConfigFile(pathname, label, scopedRoot) {
           args,
           env: serverEnv,
           envKeys: Object.keys(serverEnv),
-          cwd,
+          cwd: resolvedCwd,
           secretValues,
         })
       } else {
@@ -213,7 +227,8 @@ function safeText(value, secretValues) {
     .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/gu, "�")
     .replace(/\b(?:sk-[A-Za-z0-9_-]{16,}|GOCSPX-[A-Za-z0-9_-]{12,}|re_[A-Za-z0-9_-]{16,}|AIza[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/gu, "[SECRET OMITTED]")
     .replace(/(Authorization\s*:\s*Bearer\s+)[A-Za-z0-9._~+/-]{12,}/giu, "$1[SECRET OMITTED]")
-    .replace(/((?:api[_-]?key|secret|password|token)\s*[=:]\s*["']?)[^\s"'`,;]{8,}/giu, "$1[SECRET OMITTED]")
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/-]{12,}/giu, "Bearer [SECRET OMITTED]")
+    .replace(/((?:\bauthorization|\bauth\b|\bcookie\b|api[_-]?key|client[_-]?secret|access[_-]?token|refresh[_-]?token|secret|password|token)\s*[=:]\s*["']?)[^\s"'`,;]{8,}/giu, "$1[SECRET OMITTED]")
   for (const secret of secretValues) {
     if (secret.length >= 4) result = result.split(secret).join("[SECRET OMITTED]")
   }
@@ -251,7 +266,7 @@ export async function connectMcpServers({ roots, userConfigPath, approveServer, 
     let transport
     let stderrTail = ""
     try {
-      client = new Client({ name: "dreyzecode", version: "0.5.0" })
+      client = new Client({ name: "dreyzecode", version: "0.5.1" })
       if (server.type === "stdio") {
         transport = new StdioClientTransport({
           command: server.command,

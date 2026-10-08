@@ -9,7 +9,7 @@ import { access, chmod, copyFile, lstat, mkdir, open, readdir, readFile, realpat
 import { fileURLToPath } from "node:url"
 import { connectMcpServers, listConfiguredMcpServers } from "./mcp-client.mjs"
 
-export const VERSION = "0.5.0"
+export const VERSION = "0.5.1"
 const MAX_STEPS = 80
 const MAX_HISTORY = 40
 const MAX_MESSAGE_CHARS = 24_000
@@ -31,7 +31,6 @@ const TOOLS = new Set([
   "list_files", "read_file", "search_text", "create_directory", "copy_file", "move_file",
   "write_file", "edit_file", "delete_file", "run_command", "ask_user", "delegate_task", "web_search",
 ])
-const DEFAULT_URL = "https://moonfacet.com"
 const packageDirectory = dirname(fileURLToPath(import.meta.url))
 const configRoot = platform === "win32"
   ? join(env.APPDATA || join(homedir(), "AppData", "Roaming"), "DreyzeCode")
@@ -1030,7 +1029,7 @@ async function canonicalRoots(workspace, addDirs) {
   return roots
 }
 
-async function sessionFor(options, store, catalog, workspace) {
+async function sessionFor(options, store, catalog) {
   if (options.sessionID) return store.load(options.sessionID)
   if (options.continuing) {
     try { return await store.latest() } catch (error) {
@@ -1303,7 +1302,7 @@ export async function runCli(args = process.argv.slice(2)) {
   }
   const roots = await canonicalRoots(workspace, options.addDirs)
   const store = createSessionStore(workspace)
-  const session = await sessionFor(options, store, catalog, workspace)
+  const session = await sessionFor(options, store, catalog)
   if (options.model && !catalog.models.some((model) => model.id === options.model || model.name.toLowerCase() === options.model.toLowerCase())) {
     throw new Error(`Модель «${options.model}» отсутствует в каталоге Dreyze.`)
   }
