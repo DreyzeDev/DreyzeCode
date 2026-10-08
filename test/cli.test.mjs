@@ -12,6 +12,7 @@ import {
   executeTool,
   fetchModelCatalog,
   formatChatMessage,
+  isSlashCommandPalette,
   isSensitivePath,
   loadProjectInstructions,
   loadProjectSkills,
@@ -52,6 +53,13 @@ test("parses DreyzeCode slash commands with multiword arguments and literal slas
   assert.equal(parseSlashCommand("Build a storefront"), null)
 })
 
+test("opens the slash command palette when the prompt contains only a slash", () => {
+  assert.equal(isSlashCommandPalette("/"), true)
+  assert.equal(isSlashCommandPalette("  /  "), true)
+  assert.equal(isSlashCommandPalette("/help"), false)
+  assert.equal(isSlashCommandPalette("//"), false)
+})
+
 test("completes slash commands and their mode, theme, and model arguments", () => {
   const catalog = { models: [{ id: "dreyze/opus" }, { id: "dreyze/sonnet" }] }
   assert.deepEqual(completeSlashInput("/hel"), [["/help"], "/hel"])
@@ -79,6 +87,14 @@ test("wraps long chat output to the available terminal width", () => {
   assert.ok(lines.slice(1, -1).length > 1)
   assert.ok(lines.slice(1, -1).every((line) => line.length === 40))
   assert.match(panel, /should wrap/u)
+})
+
+test("keeps Cyrillic and emoji graphemes intact in chat panels", () => {
+  const panel = formatChatMessage("Модель 🛰️", "Ответ на русском 👩‍💻 и длинное слово достоверно.", 32)
+  assert.match(panel, /Модель 🛰️/u)
+  assert.match(panel, /👩‍💻/u)
+  assert.match(panel, /достоверно/u)
+  assert.doesNotMatch(panel, /�/u)
 })
 
 test("runs authenticated web search as a read-only agent tool", async (t) => {
@@ -805,7 +821,7 @@ test("runs the CLI when invoked through the symlink npm creates for its binary",
   await symlink(cli, command, "file")
   const child = spawnSync(command, ["--version"], { encoding: "utf8" })
   assert.equal(child.status, 0, child.stderr)
-  assert.equal(child.stdout, "DreyzeCode 0.5.6\n")
+  assert.equal(child.stdout, "DreyzeCode 0.5.7\n")
 })
 
 test("help documents image input in both one-shot and interactive modes", async () => {

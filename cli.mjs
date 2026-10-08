@@ -9,7 +9,7 @@ import { access, chmod, copyFile, lstat, mkdir, open, readdir, readFile, realpat
 import { fileURLToPath } from "node:url"
 import { connectMcpServers, listConfiguredMcpServers } from "./mcp-client.mjs"
 
-export const VERSION = "0.5.6"
+export const VERSION = "0.5.7"
 const MAX_STEPS = 80
 const MAX_HISTORY = 40
 const MAX_MESSAGE_CHARS = 24_000
@@ -159,6 +159,10 @@ export function parseSlashCommand(input) {
   return { name: match[1].toLowerCase(), argument: match[2] ?? "" }
 }
 
+export function isSlashCommandPalette(input) {
+  return typeof input === "string" && input.trim() === "/"
+}
+
 export function completeSlashInput(line, catalog = { models: [] }) {
   if (typeof line !== "string" || !line.startsWith("/") || line.startsWith("//")) return [[], line]
   const match = /^\/([a-z][a-z0-9-]*)(?:\s+([\s\S]*))?$/iu.exec(line)
@@ -187,33 +191,81 @@ function safeTerminalText(value) {
     .replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "")
     .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/gu, "�")
     .replace(/\r\n?/gu, "\n")
+    .replace(/\t/gu, "    ")
+}
+
+function graphemes(value) {
+  if (typeof Intl.Segmenter === "function") {
+    return [...new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(value)].map(({ segment }) => segment)
+  }
+  return Array.from(value)
+}
+
+function terminalCellWidth(value) {
+  let width = 0
+  for (const cluster of graphemes(value)) {
+    const wide = /[\u1100-\u115f\u2329\u232a\u2e80-\u303e\u3040-\ua4cf\uac00-\ud7a3\uf900-\ufaff\ufe10-\ufe19\ufe30-\ufe6f\uff00-\uff60\uffe0-\uffe6\u{1f1e6}-\u{1f1ff}\u{1f300}-\u{1faff}\u{20000}-\u{3fffd}]/u.test(cluster)
+    if (wide) width += 2
+    else if (!/^[\p{Mark}\u200d\ufe0e\ufe0f]+$/u.test(cluster)) width++
+  }
+  return width
+}
+
+function takeTerminalCells(value, maxWidth) {
+  let output = ""
+  let width = 0
+  for (const cluster of graphemes(value)) {
+    const clusterWidth = terminalCellWidth(cluster)
+    if (width + clusterWidth > maxWidth) break
+    output += cluster
+    width += clusterWidth
+  }
+  return output
+}
+
+function wrapTerminalLine(line, maxWidth) {
+  if (!line) return [""]
+  const indentation = line.match(/^ */u)?.[0] ?? ""
+  const words = line.slice(indentation.length).trim().split(/\s+/u).filter(Boolean)
+  if (!words.length) return [takeTerminalCells(indentation, maxWidth)]
+  const output = []
+  let current = takeTerminalCells(indentation, Math.max(0, maxWidth - 1))
+  for (const word of words) {
+    const wordWidth = terminalCellWidth(word)
+    const separator = current.trim() ? " " : ""
+    if (terminalCellWidth(`${current}${separator}${word}`) <= maxWidth) {
+      current += `${separator}${word}`
+      continue
+    }
+    if (current) output.push(current)
+    current = ""
+    let remainder = word
+    while (terminalCellWidth(remainder) > maxWidth) {
+      let part = ""
+      for (const cluster of graphemes(remainder)) {
+        if (terminalCellWidth(part) + terminalCellWidth(cluster) > maxWidth) break
+        part += cluster
+      }
+      if (!part) break
+      output.push(part)
+      remainder = remainder.slice(part.length)
+    }
+    current = remainder
+    if (!wordWidth) current = word
+  }
+  if (current || !output.length) output.push(current)
+  return output
 }
 
 export function formatChatMessage(title, content, requestedWidth = 76) {
   const width = Math.max(32, Math.min(100, Number.isInteger(requestedWidth) ? requestedWidth : 76))
-  const safeTitle = safeTerminalText(title).replace(/\n/gu, " ").slice(0, width - 10) || "DreyzeCode"
+  const safeTitle = takeTerminalCells(safeTerminalText(title).replace(/\n/gu, " "), width - 10) || "DreyzeCode"
   const contentWidth = width - 4
-  const header = `╭─ ${safeTitle} ${"─".repeat(Math.max(2, width - safeTitle.length - 5))}╮`
+  const header = `╭─ ${safeTitle} ${"─".repeat(Math.max(2, width - terminalCellWidth(safeTitle) - 5))}╮`
   const wrapped = safeTerminalText(content).split("\n").flatMap((line) => {
-    if (!line) return [""]
-    const output = []
-    let current = ""
-    for (const word of line.split(/\s+/u)) {
-      if (!current) current = word
-      else if (current.length + word.length + 1 <= contentWidth) current += ` ${word}`
-      else {
-        output.push(current)
-        current = word
-      }
-      while (current.length > contentWidth) {
-        output.push(current.slice(0, contentWidth))
-        current = current.slice(contentWidth)
-      }
-    }
-    output.push(current)
-    return output
+    return wrapTerminalLine(line, contentWidth)
   })
-  const lines = wrapped.map((line) => `│ ${line.padEnd(contentWidth)} │`)
+  const lines = wrapped.map((line) => `│ ${line}${" ".repeat(Math.max(0, contentWidth - terminalCellWidth(line)))} │`)
   return [header, ...lines, `╰${"─".repeat(width - 2)}╯`].join("\n")
 }
 
@@ -235,7 +287,8 @@ function printHelp() {
     `  dreyzecode api get /api/...            безопасный GET к API Dreyze\n\n` +
     `Параметры: --model ID, --mode build|plan, --add-dir PATH, --image PATH (повторяемый), --session ID, --json, --yes\n` +
     `В Build изменения файлов и команды требуют подтверждения. Plan разрешает только чтение.\n` +
-    `В интерактивном режиме: /help, /mode, /model, /attach, /detach, /theme, /status, /sessions, /resume, /new, /clear, /exit.\n`)
+    `В интерактивном режиме: / открывает команды; Tab дополняет команды и модели.\n` +
+    `Команды: /help, /mode, /model, /attach, /detach, /theme, /status, /sessions, /resume, /new, /clear, /exit.\n`)
 }
 
 function jsonOut(value) {
@@ -814,8 +867,13 @@ async function callAgent(config, session, fetchImpl = fetch, projectInstructions
 function startWaitIndicator(step) {
   if (!stderr.isTTY) return () => {}
   let frame = 0
+  const startedAt = Date.now()
+  const frames = ["◐", "◓", "◑", "◒"]
   const render = () => {
-    stderr.write(`\rDreyzeCode · модель отвечает · шаг ${step + 1}${".".repeat((frame++ % 3) + 1)}   `)
+    const elapsed = Math.floor((Date.now() - startedAt) / 1000)
+    const spinner = frames[frame++ % frames.length]
+    const label = `${spinner} DreyzeCode · ответ модели · шаг ${step + 1} · ${elapsed} с`
+    stderr.write(`\r\u001b[2K${env.NO_COLOR === undefined ? `\u001b[96m${label}\u001b[0m` : label}`)
   }
   render()
   const timer = setInterval(render, 900)
@@ -1189,7 +1247,8 @@ function writeChatMessage(title, content, color = (text) => text) {
 function printSlashHelp(color) {
   const rows = SLASH_COMMANDS.map(({ usage, description }) => `${usage.padEnd(25)} ${description}`)
   rows.push(`${"//текст".padEnd(25)} отправить модели текст, начинающийся с /`)
-  writeChatMessage("Команды DreyzeCode", rows.join("\n"), color)
+  rows.push("", "Tab — дополнить команду, режим, тему или модель.", "Enter — отправить задачу · / — снова открыть список.")
+  writeChatMessage("Команды DreyzeCode · свои команды", rows.join("\n"), color)
 }
 
 function printHumanModels(catalog) {
@@ -1318,7 +1377,7 @@ async function interactive(options, config, catalog, initialSession, store, root
   const printSessionHeader = () => {
     const mode = session.mode === "plan" ? "Plan · только чтение" : "Build · изменения с подтверждением"
     writeChatMessage("DreyzeCode", `Проект: ${workspace}\nМодель: ${session.model}\nРежим: ${mode}`, color)
-    stdout.write("Напишите задачу или введите /help.\n")
+    stdout.write("Сообщение отправляется по Enter · команды: / или /help · Tab показывает подсказки.\n")
   }
   const printModels = () => {
     const rows = catalog.models.map((model) => `${model.id === session.model ? "●" : "○"} ${model.name} · ${model.id}${model.supportsImages ? " · images" : ""}`)
@@ -1340,8 +1399,12 @@ async function interactive(options, config, catalog, initialSession, store, root
   })
   if (options.continuing && session.pendingQuestion && !resumed) return
   while (true) {
-    const input = await questioner.ask(`\n${color("❯")} `)
+    const input = await questioner.ask(`\n${color("›")} `)
     if (!input) { if (!stdin.isTTY) break; continue }
+    if (isSlashCommandPalette(input)) {
+      printSlashHelp(color)
+      continue
+    }
     const parsedCommand = parseSlashCommand(input)
     if (parsedCommand) {
       const { name, argument } = parsedCommand
