@@ -9,7 +9,7 @@ import { access, chmod, copyFile, lstat, mkdir, open, readdir, readFile, realpat
 import { fileURLToPath } from "node:url"
 import { connectMcpServers, listConfiguredMcpServers } from "./mcp-client.mjs"
 
-export const VERSION = "0.5.7"
+export const VERSION = "0.5.8"
 const MAX_STEPS = 80
 const MAX_HISTORY = 40
 const MAX_MESSAGE_CHARS = 24_000
@@ -864,7 +864,7 @@ async function callAgent(config, session, fetchImpl = fetch, projectInstructions
   return body
 }
 
-function startWaitIndicator(step) {
+function startWaitIndicator(step, activity = "ответ модели") {
   if (!stderr.isTTY) return () => {}
   let frame = 0
   const startedAt = Date.now()
@@ -872,7 +872,7 @@ function startWaitIndicator(step) {
   const render = () => {
     const elapsed = Math.floor((Date.now() - startedAt) / 1000)
     const spinner = frames[frame++ % frames.length]
-    const label = `${spinner} DreyzeCode · ответ модели · шаг ${step + 1} · ${elapsed} с`
+    const label = `${spinner} DreyzeCode · ${activity} · шаг ${step + 1} · ${elapsed} с`
     stderr.write(`\r\u001b[2K${env.NO_COLOR === undefined ? `\u001b[96m${label}\u001b[0m` : label}`)
   }
   render()
@@ -882,6 +882,25 @@ function startWaitIndicator(step) {
     clearInterval(timer)
     stderr.write("\r\u001b[2K")
   }
+}
+
+function toolActivityLabel(actionName, isMcpAction) {
+  if (isMcpAction) return "выполняю MCP-инструмент"
+  const labels = {
+    list_files: "изучаю файлы проекта",
+    read_file: "читаю файл проекта",
+    search_text: "ищу по проекту",
+    create_directory: "создаю папку",
+    copy_file: "копирую файл",
+    move_file: "перемещаю файл или папку",
+    write_file: "создаю файл",
+    edit_file: "редактирую файл",
+    delete_file: "удаляю файл",
+    run_command: "выполняю команду",
+    delegate_task: "исследую отдельную подзадачу",
+    web_search: "ищу информацию в интернете",
+  }
+  return labels[actionName] ?? "выполняю действие"
 }
 
 function actionJSON(action) {
@@ -932,7 +951,7 @@ async function approveMcpTool(action, mcp, { yes, question }) {
   return typeof answer === "string" && /^(y|yes|д|да)$/iu.test(answer.trim())
 }
 
-export async function runAgentTask({ config, catalog, session, store, roots, workspace, question, yes = false, fetchImpl = fetch, onOutput = () => {} }) {
+export async function runAgentTask({ config, catalog, session, store, roots, workspace, question, yes = false, fetchImpl = fetch, onOutput = () => {}, onActivity = () => () => {} }) {
   await recoverPendingAction(session, store)
   const [projectInstructions, projectSkills] = await Promise.all([
     loadProjectInstructions(roots),
@@ -950,7 +969,7 @@ export async function runAgentTask({ config, catalog, session, store, roots, wor
   let repeatedActionCount = 0
   try {
     for (let step = 0; step < MAX_STEPS; step++) {
-    const stopWaiting = startWaitIndicator(step)
+    const stopWaiting = startWaitIndicator(step, "модель отвечает")
     let action
     try {
       action = await callAgent(config, session, fetchImpl, projectInstructions, projectSkills, roots, catalog, mcp.tools)
@@ -1009,6 +1028,9 @@ export async function runAgentTask({ config, catalog, session, store, roots, wor
       await store.save(session)
     }
     let result
+    const stopActivity = action.name === "ask_user"
+      ? () => {}
+      : onActivity(toolActivityLabel(action.name, mcpAction), step)
     try {
       result = mcpAction ? await mcp.call(action.name, action.input) : await executeTool(action, {
         workspace,
@@ -1039,6 +1061,8 @@ export async function runAgentTask({ config, catalog, session, store, roots, wor
       })
     } catch (error) {
       result = { output: `Инструмент завершился ошибкой: ${error instanceof Error ? error.message : "неизвестная ошибка"}` }
+    } finally {
+      stopActivity?.()
     }
     session.pendingAction = null
     if (result?.requiresInput) {
@@ -1317,6 +1341,7 @@ async function runPrompt(prompt, options, config, catalog, session, store, roots
   const result = await runAgentTask({
     config, catalog, session, store, roots, workspace, yes: options.yes,
     question: questioner.ask,
+    onActivity: (activity, step) => startWaitIndicator(step, activity),
     onOutput: (text) => {
       if (options.json) return
       if (typeof options.chatColor === "function") writeChatMessage(`DreyzeCode · ${session.model} · ${session.mode}`, text, options.chatColor)

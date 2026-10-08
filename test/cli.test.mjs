@@ -143,6 +143,41 @@ test("runs authenticated web search as a read-only agent tool", async (t) => {
   assert.ok(session.messages.some((message) => message.content.startsWith("Tool result (web_search):")))
 })
 
+test("reports which local tool the agent is running and clears its activity state", async (t) => {
+  const { workspace, config } = await fixture(t)
+  await writeFile(path.join(workspace, "notes.txt"), "Saved project notes.")
+  const store = createSessionStore(workspace, config)
+  const session = await store.create("dreyze/research", "plan")
+  session.messages.push({ role: "user", content: "Read the project notes." })
+  const activities = []
+  let turns = 0
+  const result = await runAgentTask({
+    config: { url: "https://moonfacet.example", cookie: "__Host-dreyzeai_session=abc" },
+    catalog: { models: [], defaultModel: "dreyze/research" },
+    session,
+    store,
+    roots: [workspace],
+    workspace,
+    question: async () => null,
+    onOutput: () => {},
+    onActivity: (activity, step) => {
+      activities.push({ phase: "start", activity, step })
+      return () => activities.push({ phase: "stop", activity, step })
+    },
+    fetchImpl: async () => {
+      turns++
+      return turns === 1
+        ? Response.json({ type: "tool", name: "read_file", input: { path: "notes.txt" } })
+        : Response.json({ type: "final", content: "The notes say the project notes are saved." })
+    },
+  })
+  assert.equal(result.final, "The notes say the project notes are saved.")
+  assert.deepEqual(activities, [
+    { phase: "start", activity: "читаю файл проекта", step: 0 },
+    { phase: "stop", activity: "читаю файл проекта", step: 0 },
+  ])
+})
+
 test("connects to a confirmed stdio MCP server and redacts its configured secrets", async (t) => {
   const { workspace } = await fixture(t)
   const secret = "mcp-fixture-private-value-7821"
@@ -821,7 +856,7 @@ test("runs the CLI when invoked through the symlink npm creates for its binary",
   await symlink(cli, command, "file")
   const child = spawnSync(command, ["--version"], { encoding: "utf8" })
   assert.equal(child.status, 0, child.stderr)
-  assert.equal(child.stdout, "DreyzeCode 0.5.7\n")
+  assert.equal(child.stdout, "DreyzeCode 0.5.8\n")
 })
 
 test("help documents image input in both one-shot and interactive modes", async () => {

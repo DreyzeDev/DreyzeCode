@@ -58,7 +58,7 @@ each time they are sent. Each image is limited to 2.9 MB and a message to 7 MB
 total.
 
 Interactive mode renders sent prompts and model replies in separate chat
-panels. Enter `/` to open the command palette or press Tab to complete commands,
+panels. A live status shows when the model or a local tool is working. Enter `/` to open the command palette or press Tab to complete commands,
 modes, themes, and available models. `/help` lists the DreyzeCode commands:
 `/model`, `/mode`, `/attach`, `/detach`, `/theme`, `/status`, `/sessions`,
 `/resume`, `/new`, `/clear`, and `/exit`. Prefix a message with `//` when it
