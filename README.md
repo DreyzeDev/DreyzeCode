@@ -36,8 +36,12 @@ dreyzecode sessions list
 Build mode can read and search project files. It asks before changing files,
 running commands, or creating folders. Plan mode is read-only. Run commands are
 executed from the selected project directory. Secret and credential files are
-blocked from reads and searches. `--yes` approves requested changes and shell
-commands for unattended runs; use it only when the task and workspace are
+blocked from reads and searches. Build can ask permission to start an isolated,
+read-only research subagent; its findings appear in the parent session and its
+own session remains available in the session list. Moving a folder renames it
+inside the approved project; moving the project root or moving a folder into
+itself is blocked. `--yes` approves requested changes, shell commands, and
+subagent work for unattended runs; use it only when the task and workspace are
 trusted.
 
 Sessions are stored under the user's DreyzeCode configuration directory, keyed
@@ -58,7 +62,8 @@ read-only same-origin escape hatch restricted to `/api/` paths.
 - `login`, `logout`, `doctor`, `models list`, `sessions list`, `sessions show`
 - Interactive chat, `run`, `--continue`, `--session`, `--model`, and `--mode`
 - Local tools: list/read/search, create/copy/move/write/edit/delete files,
-  create folders, run approved commands, and ask the user
+  create folders, run approved commands, ask the user, and start a read-only
+  research subagent in Build mode
 - `api get` for read-only diagnostics
 
 The CLI uses `/api/code/agent/turn` and `/api/code/v1/models` on the configured

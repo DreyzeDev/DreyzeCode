@@ -16,11 +16,11 @@ const MAX_TOOL_OUTPUT = 12_000
 const MAX_READ_BYTES = 1_000_000
 const MAX_WRITE_BYTES = 500_000
 const IGNORED_SEARCH_DIRS = new Set([".git", ".next", ".turbo", "build", "dist", "node_modules", "target", "vendor"])
-const MUTATING_TOOLS = new Set(["create_directory", "copy_file", "move_file", "write_file", "edit_file", "delete_file", "run_command"])
+const MUTATING_TOOLS = new Set(["create_directory", "copy_file", "move_file", "write_file", "edit_file", "delete_file", "run_command", "delegate_task"])
 const PLAN_TOOLS = new Set(["list_files", "read_file", "search_text", "ask_user"])
 const TOOLS = new Set([
   "list_files", "read_file", "search_text", "create_directory", "copy_file", "move_file",
-  "write_file", "edit_file", "delete_file", "run_command", "ask_user",
+  "write_file", "edit_file", "delete_file", "run_command", "ask_user", "delegate_task",
 ])
 const DEFAULT_URL = "https://moonfacet.com"
 const packageDirectory = dirname(fileURLToPath(import.meta.url))
@@ -233,7 +233,7 @@ function projectKey(workspace) {
   return createHash("sha256").update(workspace).digest("hex").slice(0, 32)
 }
 
-export function createSessionStore(workspace, root = configRoot) {
+export function createSessionStore(workspace, root = configRoot, { updateLatestPointer = true } = {}) {
   const directory = join(root, "sessions", projectKey(workspace))
   const fileFor = (id) => {
     if (typeof id !== "string" || !/^[0-9a-f-]{36}$/iu.test(id)) throw new Error("Некорректный ID сессии.")
@@ -257,7 +257,7 @@ export function createSessionStore(workspace, root = configRoot) {
       const id = (await readFile(join(directory, "latest"), "utf8")).trim()
       return this.load(id)
     },
-    async save(session) {
+    async save(session, { updateLatest = updateLatestPointer } = {}) {
       await mkdir(directory, { recursive: true, mode: 0o700 })
       const target = fileFor(session.id)
       session.updatedAt = new Date().toISOString()
@@ -271,9 +271,14 @@ export function createSessionStore(workspace, root = configRoot) {
       }
       await rename(temp, target)
       if (platform !== "win32") await chmod(target, 0o600).catch(() => undefined)
-      const latestTemp = join(directory, `latest.${randomUUID()}.tmp`)
-      await writeFile(latestTemp, `${session.id}\n`, { mode: 0o600 })
-      await rename(latestTemp, join(directory, "latest"))
+      if (updateLatest) {
+        const latestTemp = join(directory, `latest.${randomUUID()}.tmp`)
+        await writeFile(latestTemp, `${session.id}\n`, { mode: 0o600 })
+        await rename(latestTemp, join(directory, "latest"))
+      }
+    },
+    fork({ updateLatestPointer: childUpdatesLatest = false } = {}) {
+      return createSessionStore(workspace, root, { updateLatestPointer: childUpdatesLatest })
     },
     async list(limit = 20) {
       const entries = await readdir(directory, { withFileTypes: true }).catch((error) => error?.code === "ENOENT" ? [] : Promise.reject(error))
@@ -282,7 +287,15 @@ export function createSessionStore(workspace, root = configRoot) {
       for (const entry of files) {
         try {
           const parsed = JSON.parse(await readFile(join(directory, entry.name), "utf8"))
-          values.push({ id: parsed.id, model: parsed.model, mode: parsed.mode, updatedAt: parsed.updatedAt, messages: Array.isArray(parsed.messages) ? parsed.messages.length : 0 })
+          values.push({
+            id: parsed.id,
+            model: parsed.model,
+            mode: parsed.mode,
+            title: typeof parsed.title === "string" ? parsed.title : null,
+            parentSessionId: typeof parsed.parentSessionId === "string" ? parsed.parentSessionId : null,
+            updatedAt: parsed.updatedAt,
+            messages: Array.isArray(parsed.messages) ? parsed.messages.length : 0,
+          })
         } catch {}
       }
       return values.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)))
@@ -347,6 +360,7 @@ async function askApproval(action, options) {
     delete_file: `Удалить файл ${action.input.path}?`,
     copy_file: `Скопировать ${action.input.source} в ${action.input.destination}?`,
     move_file: `Переместить ${action.input.source} в ${action.input.destination}?`,
+    delegate_task: `Запустить исследовательского подагента в режиме только чтения?\nЗадача: ${preview(action.input.task)}`,
     create_directory: `Создать папку ${action.input.path}?`,
     run_command: `Выполнить команду:\n${action.input.command}`,
   }
@@ -386,7 +400,7 @@ async function runShell(command, workspace) {
   })
 }
 
-export async function executeTool(action, { workspace, roots, approve, question }) {
+export async function executeTool(action, { workspace, roots, approve, question, delegate }) {
   const input = action.input || {}
   const getPath = (name = "path", required = true) => {
     const value = input[name]
@@ -398,6 +412,12 @@ export async function executeTool(action, { workspace, roots, approve, question 
     const answer = await question(`${prompt}: `)
     if (answer === null) return { requiresInput: prompt, output: "Ожидается ответ пользователя в следующем запуске CLI." }
     return { output: answer || "Пользователь не указал ответ." }
+  }
+  if (action.name === "delegate_task") {
+    const task = getPath("task")
+    if (task.length > 6_000) throw new Error("Задача подагента превышает 6000 символов.")
+    if (typeof delegate !== "function") throw new Error("Исследовательский подагент недоступен в этом режиме.")
+    return await delegate(task)
   }
   if (action.name === "list_files") {
     const directory = await resolveWorkspacePath(getPath("path", false) || ".", roots, { mustExist: true, allowSensitive: true })
@@ -628,6 +648,25 @@ export async function runAgentTask({ config, catalog, session, store, roots, wor
         approve: async () => true,
         question,
         yes: true,
+        delegate: async (task) => {
+          if (typeof store.fork !== "function") throw new Error("Не удалось создать отдельную сессию подагента.")
+          const subagentStore = store.fork()
+          const subagent = await subagentStore.create(session.model, "plan")
+          subagent.parentSessionId = session.id
+          subagent.title = task.slice(0, 100)
+          appendMessage(subagent, "user", `Проведи отдельное исследование проекта по задаче:\n${task}\n\nТолько читай и ищи файлы. Не изменяй проект и не запускай команды. Верни конкретные наблюдения, пути и выводы для основного агента.`)
+          await subagentStore.save(subagent)
+          const result = await runAgentTask({
+            config, catalog, session: subagent, store: subagentStore, roots, workspace,
+            question: async () => null,
+            yes: false,
+            fetchImpl,
+            onOutput: () => {},
+          })
+          if (result.final) return { output: `Результат исследовательского подагента (только чтение):\n${result.final}` }
+          if (result.requiresInput) return { output: `Подагенту требуется уточнение, которое нужно задать пользователю: ${result.requiresInput}` }
+          return { output: "Подагент завершил исследование без итогового ответа." }
+        },
       })
     } catch (error) {
       result = { output: `Инструмент завершился ошибкой: ${error instanceof Error ? error.message : "неизвестная ошибка"}` }
@@ -716,7 +755,10 @@ async function listSessions(options, workspace) {
   const store = createSessionStore(workspace)
   const sessions = await store.list(100)
   if (options.json) jsonOut({ ok: true, sessions })
-  else for (const session of sessions) stdout.write(`${session.id}\t${session.mode}\t${session.model}\t${session.updatedAt}\t${session.messages} messages\n`)
+  else for (const session of sessions) {
+    const kind = session.parentSessionId ? `subagent${session.title ? ` · ${session.title}` : ""}` : "session"
+    stdout.write(`${session.id}\t${kind}\t${session.mode}\t${session.model}\t${session.updatedAt}\t${session.messages} messages\n`)
+  }
 }
 
 async function showSession(options, workspace) {
@@ -724,7 +766,15 @@ async function showSession(options, workspace) {
   const id = options.positionals[1]
   if (!id) throw new Error("sessions show требует ID сессии.")
   const session = await store.load(id)
-  const output = { id: session.id, model: session.model, mode: session.mode, updatedAt: session.updatedAt, messages: session.messages }
+  const output = {
+    id: session.id,
+    model: session.model,
+    mode: session.mode,
+    title: session.title ?? null,
+    parentSessionId: session.parentSessionId ?? null,
+    updatedAt: session.updatedAt,
+    messages: session.messages,
+  }
   if (options.json) jsonOut({ ok: true, session: output })
   else for (const message of output.messages) stdout.write(`\n${message.role.toUpperCase()}\n${message.content}\n`)
 }

@@ -185,6 +185,47 @@ test("stores a write intent before execution and carries the result into the nex
   assert.ok(session.messages.some((message) => message.content.includes("File created")))
 })
 
+test("runs an isolated read-only subagent without changing the project's latest session", async (t) => {
+  const { workspace, config } = await fixture(t)
+  const store = createSessionStore(workspace, config)
+  const session = await store.create("dreyze/test-model", "build")
+  session.messages.push({ role: "user", content: "Inspect the project and report findings." })
+  await store.save(session)
+  let calls = 0
+  const result = await runAgentTask({
+    config: { url: "https://moonfacet.example", cookie: "session" },
+    catalog: { models: [], defaultModel: "dreyze/test-model" },
+    session,
+    store,
+    roots: [workspace],
+    workspace,
+    yes: true,
+    question: async () => "",
+    onOutput: () => {},
+    fetchImpl: async (_url, init) => {
+      calls++
+      const request = JSON.parse(init.body)
+      if (request.mode === "plan") {
+        assert.match(request.messages.at(-1).content, /Не изменяй проект/u)
+        return Response.json({ type: "final", content: "The project uses a single entry point." })
+      }
+      if (calls === 1) {
+        return Response.json({ type: "tool", name: "delegate_task", input: { task: "Find the project entry point." } })
+      }
+      return Response.json({ type: "final", content: "The entry point is documented." })
+    },
+  })
+  assert.equal(result.final, "The entry point is documented.")
+  assert.equal(calls, 3)
+  assert.ok(session.messages.some((message) => message.content.includes("single entry point")))
+  const latest = await store.latest()
+  assert.equal(latest.id, session.id)
+  const sessions = await store.list()
+  const child = sessions.find((item) => item.parentSessionId === session.id)
+  assert.equal(child?.mode, "plan")
+  assert.equal(child?.title, "Find the project entry point.")
+})
+
 test("converts an interrupted mutating action into an unknown-outcome notice without replay", async (t) => {
   const { workspace, config } = await fixture(t)
   const store = createSessionStore(workspace, config)
