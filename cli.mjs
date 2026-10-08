@@ -8,14 +8,17 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import { access, chmod, copyFile, lstat, mkdir, open, readdir, readFile, realpath, rename, stat, unlink, writeFile } from "node:fs/promises"
 import { fileURLToPath } from "node:url"
 
-export const VERSION = "0.1.0"
+export const VERSION = "0.2.0"
 const MAX_STEPS = 80
 const MAX_HISTORY = 40
 const MAX_MESSAGE_CHARS = 24_000
 const MAX_TOOL_OUTPUT = 12_000
 const MAX_READ_BYTES = 1_000_000
 const MAX_WRITE_BYTES = 500_000
-const IGNORED_SEARCH_DIRS = new Set([".git", ".next", ".turbo", "build", "dist", "node_modules", "target", "vendor"])
+const MAX_PROJECT_INSTRUCTION_FILES = 40
+const MAX_PROJECT_INSTRUCTION_CHARS = 24_000
+const MAX_PROJECT_INSTRUCTION_FILE_BYTES = 32_000
+const IGNORED_SEARCH_DIRS = new Set([".git", ".next", ".turbo", ".venv", "venv", "build", "dist", "node_modules", "target", "vendor", "coverage"])
 const MUTATING_TOOLS = new Set(["create_directory", "copy_file", "move_file", "write_file", "edit_file", "delete_file", "run_command", "delegate_task"])
 const PLAN_TOOLS = new Set(["list_files", "read_file", "search_text", "ask_user"])
 const TOOLS = new Set([
@@ -568,11 +571,11 @@ function truncateOutput(value) {
   return text.length <= MAX_TOOL_OUTPUT ? text : `${text.slice(0, MAX_TOOL_OUTPUT)}\n[Вывод сокращён]`
 }
 
-async function callAgent(config, session, fetchImpl = fetch) {
+async function callAgent(config, session, fetchImpl = fetch, projectInstructions = []) {
   const response = await fetchImpl(new URL("/api/code/agent/turn", config.url), {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json", Cookie: config.cookie },
-    body: JSON.stringify({ model: session.model, mode: session.mode, messages: session.messages.slice(-MAX_HISTORY) }),
+    body: JSON.stringify({ model: session.model, mode: session.mode, messages: session.messages.slice(-MAX_HISTORY), projectInstructions }),
     redirect: "error",
     signal: AbortSignal.timeout(160_000),
   })
@@ -604,10 +607,11 @@ function actionJSON(action) {
 export async function runAgentTask({ config, catalog, session, store, roots, workspace, question, yes = false, fetchImpl = fetch, onOutput = () => {} }) {
   await recoverPendingAction(session, store)
   for (let step = 0; step < MAX_STEPS; step++) {
+    const projectInstructions = await loadProjectInstructions(roots)
     const stopWaiting = startWaitIndicator(step)
     let action
     try {
-      action = await callAgent(config, session, fetchImpl)
+      action = await callAgent(config, session, fetchImpl, projectInstructions)
     } finally {
       stopWaiting()
     }
@@ -682,6 +686,69 @@ export async function runAgentTask({ config, catalog, session, store, roots, wor
     await store.save(session)
   }
   throw Object.assign(new Error(`Агент достиг лимита ${MAX_STEPS} шагов и сохранил сессию. Продолжите через --continue.`), { code: "STEP_LIMIT" })
+}
+
+export async function loadProjectInstructions(roots) {
+  const files = []
+  const seen = new Set()
+  let visitedDirectories = 0
+  let remaining = MAX_PROJECT_INSTRUCTION_CHARS
+  let truncated = false
+
+  async function walk(root, directory) {
+    if (files.length >= MAX_PROJECT_INSTRUCTION_FILES || visitedDirectories >= 3_000 || remaining <= 0) {
+      truncated = true
+      return
+    }
+    visitedDirectories++
+    const entries = await readdir(directory, { withFileTypes: true }).catch(() => [])
+    entries.sort((a, b) => a.name.localeCompare(b.name))
+    for (const entry of entries) {
+      if (files.length >= MAX_PROJECT_INSTRUCTION_FILES || visitedDirectories >= 3_000 || remaining <= 0) {
+        truncated = true
+        return
+      }
+      const pathname = join(directory, entry.name)
+      if (entry.isDirectory()) {
+        if (!IGNORED_SEARCH_DIRS.has(entry.name)) await walk(root, pathname)
+        continue
+      }
+      const isRootGuide = entry.isFile() && entry.name.toLocaleLowerCase() === "agents.md"
+      const isDreyzeGuide = entry.isFile() && entry.name.toLocaleLowerCase() === "instructions.md" && basename(directory).toLocaleLowerCase() === ".dreyze"
+      if (!isRootGuide && !isDreyzeGuide) continue
+      if (isSensitivePath(pathname)) continue
+      const info = await lstat(pathname).catch(() => null)
+      if (!info?.isFile() || info.isSymbolicLink() || info.size > MAX_PROJECT_INSTRUCTION_FILE_BYTES) continue
+      const canonicalPath = await realpath(pathname).catch(() => null)
+      if (!canonicalPath || !within(root, canonicalPath) || seen.has(canonicalPath)) continue
+      seen.add(canonicalPath)
+      const available = Math.min(remaining, MAX_PROJECT_INSTRUCTION_FILE_BYTES)
+      const content = (await readFile(canonicalPath, "utf8").catch(() => "")).replace(/^\uFEFF/u, "")
+      if (!content.trim()) continue
+      const clipped = content.length > available
+      const clipMarker = "\n[Инструкции сокращены по лимиту контекста]"
+      const body = clipped && available > clipMarker.length
+        ? `${content.slice(0, available - clipMarker.length)}${clipMarker}`
+        : clipped ? content.slice(0, available) : content
+      const rootLabel = roots.indexOf(root) === 0 ? "." : `--add-dir ${roots.indexOf(root) + 1}`
+      const relativePath = relative(root, canonicalPath).split(sep).join("/") || entry.name
+      const safeBody = redactSecrets(body)
+      files.push({ path: `${rootLabel}/${relativePath}`, content: safeBody })
+      remaining -= safeBody.length
+      if (clipped) truncated = true
+    }
+  }
+
+  for (const root of roots) await walk(root, root)
+  if (truncated && files.length) {
+    const marker = "\n[Остальные файлы инструкций не переданы из-за ограничения контекста.]"
+    const last = files.at(-1)
+    const used = files.reduce((total, item) => total + item.content.length, 0)
+    const available = MAX_PROJECT_INSTRUCTION_CHARS - used
+    const shortenBy = Math.max(0, marker.length - available)
+    last.content = `${last.content.slice(0, Math.max(0, last.content.length - shortenBy))}${marker}`
+  }
+  return files
 }
 
 function promptInterface(jsonMode = false) {

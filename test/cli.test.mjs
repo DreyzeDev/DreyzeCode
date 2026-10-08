@@ -11,6 +11,7 @@ import {
   executeTool,
   fetchModelCatalog,
   isSensitivePath,
+  loadProjectInstructions,
   parseArgs,
   redactSecrets,
   recoverPendingAction,
@@ -34,6 +35,35 @@ test("parses the product command surface with global flags before and after comm
   assert.deepEqual(parseArgs(["--model", "dreyze/model", "--mode", "plan", "run", "Review", "this"]).positionals, ["Review", "this"])
   assert.equal(parseArgs(["sessions", "list"]).command, "sessions")
   assert.equal(parseArgs(["--continue"]).continuing, true)
+})
+
+test("loads root and nested project guides while skipping generated and linked folders", async (t) => {
+  const { workspace, root } = await fixture(t)
+  await mkdir(path.join(workspace, "src"), { recursive: true })
+  await mkdir(path.join(workspace, "node_modules", "fake"), { recursive: true })
+  await mkdir(path.join(workspace, ".dreyze"), { recursive: true })
+  await writeFile(path.join(workspace, "AGENTS.md"), "Use the existing project style.\nGITHUB_TOKEN=ghp_123456789012345678901234567890\n")
+  await writeFile(path.join(workspace, "src", "AGENTS.md"), "For src, follow its local conventions.\n")
+  await writeFile(path.join(workspace, ".dreyze", "instructions.md"), "Use Dreyze project tooling.\n")
+  await writeFile(path.join(workspace, "node_modules", "fake", "AGENTS.md"), "Ignore this dependency guide.\n")
+  const outsideGuide = path.join(root, "outside-AGENTS.md")
+  await writeFile(outsideGuide, "Do not follow linked files.\n")
+  try {
+    await symlink(outsideGuide, path.join(workspace, "linked-AGENTS.md"), "file")
+  } catch (error) {
+    if (process.platform === "win32" && ["EPERM", "EACCES", "ENOTSUP"].includes(error?.code)) {
+      t.skip("Windows runner does not permit creating symlinks")
+      return
+    }
+    throw error
+  }
+
+  const guides = await loadProjectInstructions([workspace])
+  assert.deepEqual(guides.map((guide) => guide.path), ["./.dreyze/instructions.md", "./AGENTS.md", "./src/AGENTS.md"])
+  assert.match(guides.find((guide) => guide.path === "./AGENTS.md").content, /existing project style/u)
+  assert.doesNotMatch(guides.find((guide) => guide.path === "./AGENTS.md").content, /123456789012345678901234567890/u)
+  assert.equal(guides.some((guide) => guide.content.includes("dependency guide")), false)
+  assert.equal(guides.some((guide) => guide.content.includes("linked files")), false)
 })
 
 test("rejects traversal, symlink escapes, and sensitive reads", async (t) => {
@@ -148,6 +178,7 @@ test("stores a write intent before execution and carries the result into the nex
   const session = await store.create("dreyze/test-model", "build")
   session.messages.push({ role: "user", content: "Create the requested file." })
   await store.save(session)
+  await writeFile(path.join(workspace, "AGENTS.md"), "Use semicolons in new TypeScript files.")
   const save = store.save.bind(store)
   let pendingSaved = false
   store.save = async (value) => {
@@ -171,6 +202,7 @@ test("stores a write intent before execution and carries the result into the nex
       const request = JSON.parse(init.body)
       assert.equal(init.redirect, "error")
       assert.equal(request.messages.length > 0, true)
+      assert.deepEqual(request.projectInstructions, [{ path: "./AGENTS.md", content: "Use semicolons in new TypeScript files." }])
       if (calls === 1) {
         return Response.json({ type: "tool", name: "write_file", input: { path: "created.txt", content: "hello" } })
       }
@@ -329,7 +361,7 @@ test("runs the CLI when invoked through the symlink npm creates for its binary",
   await symlink(cli, command, "file")
   const child = spawnSync(command, ["--version"], { encoding: "utf8" })
   assert.equal(child.status, 0, child.stderr)
-  assert.equal(child.stdout, "DreyzeCode 0.1.0\n")
+  assert.equal(child.stdout, "DreyzeCode 0.2.0\n")
 })
 
 test("the raw API escape hatch rejects paths that normalize outside /api", async () => {

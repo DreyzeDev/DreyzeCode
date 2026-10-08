@@ -1,6 +1,6 @@
 {
   "name": "@dreyzeai/dreyzecode",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Independent DreyzeCode terminal agent",
   "type": "module",
   "files": ["cli.mjs", "auth-cli.mjs", "README.md", "LICENSE"],

@@ -44,6 +44,13 @@ itself is blocked. `--yes` approves requested changes, shell commands, and
 subagent work for unattended runs; use it only when the task and workspace are
 trusted.
 
+The agent follows project guidance from `AGENTS.md` files and
+`.dreyze/instructions.md`. Nested `AGENTS.md` files are supplied with their
+relative paths so the agent can apply the closest relevant rules. Discovery
+skips generated and dependency folders, symbolic links, oversized files, and
+secret values; the total project-guidance context is capped at 24,000
+characters.
+
 Sessions are stored under the user's DreyzeCode configuration directory, keyed
 by the canonical project path. An interrupted write or command is recorded
 before it starts. On restart the CLI reports an unknown outcome and asks the
