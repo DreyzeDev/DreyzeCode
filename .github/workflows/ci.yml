@@ -22,9 +22,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
+      - run: npm ci
       - run: npm run check
       - run: npm test
       - run: npm pack --dry-run
       - run: npm install -g .
       - run: dreyzecode --version
       - run: dreyzecode --help
+      - run: dreyzecode --json mcp list

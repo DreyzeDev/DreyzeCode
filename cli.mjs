@@ -7,8 +7,9 @@ import { env, platform, stdin, stdout, stderr } from "node:process"
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { access, chmod, copyFile, lstat, mkdir, open, readdir, readFile, realpath, rename, stat, unlink, writeFile } from "node:fs/promises"
 import { fileURLToPath } from "node:url"
+import { connectMcpServers, listConfiguredMcpServers } from "./mcp-client.mjs"
 
-export const VERSION = "0.4.2"
+export const VERSION = "0.5.0"
 const MAX_STEPS = 80
 const MAX_HISTORY = 40
 const MAX_MESSAGE_CHARS = 24_000
@@ -85,7 +86,7 @@ export async function resolveWorkspacePath(rawPath, roots, { mustExist = false, 
 }
 
 export function parseArgs(args) {
-  const commands = new Set(["login", "logout", "doctor", "models", "sessions", "skills", "api", "run", "chat", "help"])
+  const commands = new Set(["login", "logout", "doctor", "models", "sessions", "skills", "mcp", "api", "run", "chat", "help"])
   const result = { command: "interactive", positionals: [], addDirs: [], imagePaths: [], json: false, yes: false, continuing: false }
   let index = 0
   if (args[0] === "--help" || args[0] === "-h" || args[0] === "help") return { ...result, command: "help" }
@@ -149,6 +150,7 @@ function printHelp() {
     `  dreyzecode sessions list               найти локальные сессии проекта\n` +
     `  dreyzecode sessions show <id>          вывести локальную сессию\n` +
     `  dreyzecode skills list                 показать skills проекта\n` +
+    `  dreyzecode mcp list                    показать настроенные MCP серверы\n` +
     `  dreyzecode api get /api/...            безопасный GET к API Dreyze\n\n` +
     `Параметры: --model ID, --mode build|plan, --add-dir PATH, --image PATH (повторяемый), --session ID, --json, --yes\n` +
     `В Build изменения файлов и команды требуют подтверждения. Plan разрешает только чтение.\n` +
@@ -706,12 +708,12 @@ async function agentMessages(session, roots, catalog) {
   }))
 }
 
-async function callAgent(config, session, fetchImpl = fetch, projectInstructions = [], projectSkills = [], roots = [], catalog = { models: [] }) {
+async function callAgent(config, session, fetchImpl = fetch, projectInstructions = [], projectSkills = [], roots = [], catalog = { models: [] }, mcpTools = []) {
   const messages = await agentMessages(session, roots, catalog)
   const response = await fetchImpl(new URL("/api/code/agent/turn", config.url), {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json", Cookie: config.cookie },
-    body: JSON.stringify({ model: session.model, mode: session.mode, messages, projectInstructions, projectSkills }),
+    body: JSON.stringify({ model: session.model, mode: session.mode, messages, projectInstructions, projectSkills, mcpTools }),
     redirect: "error",
     signal: AbortSignal.timeout(160_000),
   })
@@ -740,17 +742,58 @@ function actionJSON(action) {
   return JSON.stringify(action)
 }
 
+function redactMcpServerCommand(server) {
+  let value = server.type === "stdio"
+    ? `${server.command} (${server.args.length} arguments)`
+    : `${server.url.origin}${server.url.pathname}`
+  for (const secret of server.secretValues ?? []) {
+    if (secret.length >= 4) value = value.split(secret).join("[SECRET OMITTED]")
+  }
+  return redactSecrets(value)
+}
+
+async function approveMcpServer(server, { yes, question }) {
+  if (yes) return true
+  const location = server.cwd ? `\nРабочая папка: ${server.cwd}` : ""
+  const configured = server.envKeys?.length
+    ? `\nНастроены переменные/заголовки: ${server.envKeys.join(", ")} (значения скрыты)`
+    : ""
+  const answer = await question(
+    `Запустить MCP сервер ${server.label}?\nТип: ${server.type}\nКоманда или адрес: ${redactMcpServerCommand(server)}${location}${configured}\n[y/N] `,
+  )
+  return typeof answer === "string" && /^(y|yes|д|да)$/iu.test(answer.trim())
+}
+
+async function approveMcpTool(action, mcp, { yes, question }) {
+  if (yes) return true
+  const tool = mcp.describe(action.name)
+  const input = mcp.redact(JSON.stringify(action.input)).slice(0, 2_500)
+  const answer = await question(
+    `Вызвать внешний MCP инструмент ${tool?.serverName ?? "сервер"} · ${tool?.toolName ?? action.name}?\nОписание: ${redactSecrets(tool?.description ?? "").slice(0, 500)}\nАргументы: ${input}${input.length >= 2_500 ? "\n[Аргументы сокращены]" : ""}\n[y/N] `,
+  )
+  return typeof answer === "string" && /^(y|yes|д|да)$/iu.test(answer.trim())
+}
+
 export async function runAgentTask({ config, catalog, session, store, roots, workspace, question, yes = false, fetchImpl = fetch, onOutput = () => {} }) {
   await recoverPendingAction(session, store)
   const [projectInstructions, projectSkills] = await Promise.all([
     loadProjectInstructions(roots),
     loadProjectSkills(roots),
   ])
-  for (let step = 0; step < MAX_STEPS; step++) {
+  const mcp = session.mode === "build"
+    ? await connectMcpServers({
+      roots,
+      userConfigPath: join(configRoot, "mcp.json"),
+      approveServer: (server) => approveMcpServer(server, { yes, question }),
+      onIssue: (issue) => stderr.write(`MCP: ${redactSecrets(issue)}\n`),
+    })
+    : { tools: [], has: () => false, describe: () => null, redact: (value) => redactSecrets(value), call: async () => { throw new Error("MCP инструменты недоступны.") }, close: async () => {} }
+  try {
+    for (let step = 0; step < MAX_STEPS; step++) {
     const stopWaiting = startWaitIndicator(step)
     let action
     try {
-      action = await callAgent(config, session, fetchImpl, projectInstructions, projectSkills, roots, catalog)
+      action = await callAgent(config, session, fetchImpl, projectInstructions, projectSkills, roots, catalog, mcp.tools)
     } finally {
       stopWaiting()
     }
@@ -768,14 +811,18 @@ export async function runAgentTask({ config, catalog, session, store, roots, wor
       if (session.mode === "plan") return { final: action.content, steps: step + 1 }
       continue
     }
-    if (!TOOLS.has(action.name) || !action.input || typeof action.input !== "object" || Array.isArray(action.input)) {
+    const mcpAction = mcp.has(action.name)
+    if ((!TOOLS.has(action.name) && !mcpAction) || !action.input || typeof action.input !== "object" || Array.isArray(action.input)) {
       throw Object.assign(new Error("Модель запросила неизвестный инструмент."), { code: "INVALID_TOOL_ACTION" })
     }
     if (session.mode === "plan" && !PLAN_TOOLS.has(action.name)) throw Object.assign(new Error("Plan разрешает только чтение файлов и поиск."), { code: "PLAN_MODE_READ_ONLY" })
     appendMessage(session, "assistant", actionJSON(action))
     await store.save(session)
-    if (MUTATING_TOOLS.has(action.name)) {
-      if (!(await askApproval(action, { yes, question }))) {
+    if (MUTATING_TOOLS.has(action.name) || mcpAction) {
+      const approved = mcpAction
+        ? await approveMcpTool(action, mcp, { yes, question })
+        : await askApproval(action, { yes, question })
+      if (!approved) {
         appendMessage(session, "user", `Tool result (${action.name}): действие отклонено пользователем.`)
         await store.save(session)
         continue
@@ -785,7 +832,7 @@ export async function runAgentTask({ config, catalog, session, store, roots, wor
     }
     let result
     try {
-      result = await executeTool(action, {
+      result = mcpAction ? await mcp.call(action.name, action.input) : await executeTool(action, {
         workspace,
         roots,
         approve: async () => true,
@@ -826,6 +873,9 @@ export async function runAgentTask({ config, catalog, session, store, roots, wor
     await store.save(session)
   }
   throw Object.assign(new Error(`Агент достиг лимита ${MAX_STEPS} шагов и сохранил сессию. Продолжите через --continue.`), { code: "STEP_LIMIT" })
+  } finally {
+    await mcp.close()
+  }
 }
 
 export async function loadProjectInstructions(roots) {
@@ -1221,6 +1271,22 @@ export async function runCli(args = process.argv.slice(2)) {
     if (options.json) jsonOut({ ok: true, skills })
     else if (!skills.length) stdout.write("В разрешённых папках проекта skills не найдены.\n")
     else for (const skill of skills) stdout.write(`${skill.name}\t${skill.path}\t${skill.description}\n`)
+    return
+  }
+  if (options.command === "mcp") {
+    const subcommand = options.positionals[0]
+    if (subcommand && subcommand !== "list") throw new Error("Использование: dreyzecode mcp list")
+    const roots = await canonicalRoots(workspace, options.addDirs)
+    const result = await listConfiguredMcpServers({ roots, userConfigPath: join(configRoot, "mcp.json") })
+    if (options.json) jsonOut({ ok: true, ...result })
+    else {
+      if (!result.servers.length) stdout.write("MCP серверы не настроены. См. раздел MCP в README.\n")
+      else for (const server of result.servers) {
+        const target = server.type === "stdio" ? server.command : server.url
+        stdout.write(`${server.name}\t${server.type}\t${target}\n`)
+      }
+      for (const issue of result.issues) stderr.write(`MCP: ${redactSecrets(issue)}\n`)
+    }
     return
   }
   if (!config) throw Object.assign(new Error("Сначала войдите: dreyzecode login."), { code: "AUTH_REQUIRED" })

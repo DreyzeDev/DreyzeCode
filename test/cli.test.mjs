@@ -21,6 +21,7 @@ import {
   runAgentTask,
   validateImagePaths,
 } from "../cli.mjs"
+import { connectMcpServers, listConfiguredMcpServers } from "../mcp-client.mjs"
 
 async function fixture(t) {
   const root = await mkdtemp(path.join(os.tmpdir(), "dreyzecode-native-"))
@@ -84,6 +85,104 @@ test("runs authenticated web search as a read-only agent tool", async (t) => {
   assert.equal(requests.length, 3)
   assert.equal(result.final, "The official documentation describes a browser-compatible Fetch API.")
   assert.ok(session.messages.some((message) => message.content.startsWith("Tool result (web_search):")))
+})
+
+test("connects to a confirmed stdio MCP server and redacts its configured secrets", async (t) => {
+  const { workspace } = await fixture(t)
+  const secret = "mcp-fixture-private-value-7821"
+  process.env.DREYZE_MCP_TEST_SECRET = secret
+  t.after(() => { delete process.env.DREYZE_MCP_TEST_SECRET })
+  await mkdir(path.join(workspace, ".dreyze"), { recursive: true })
+  const serverScript = fileURLToPath(new URL("../fixtures/mcp-stdio-server.mjs", import.meta.url))
+  await writeFile(path.join(workspace, ".dreyze", "mcp.json"), JSON.stringify({
+    mcpServers: {
+      local_docs: {
+        command: process.execPath,
+        args: [serverScript],
+        cwd: ".",
+        env: { MCP_ECHO_SECRET: "${DREYZE_MCP_TEST_SECRET}" },
+      },
+    },
+  }))
+  const listed = await listConfiguredMcpServers({ roots: [workspace], userConfigPath: path.join(workspace, "missing-mcp.json") })
+  assert.equal(listed.servers.length, 1)
+  assert.equal(listed.servers[0].type, "stdio")
+  assert.doesNotMatch(JSON.stringify(listed), new RegExp(secret, "u"))
+
+  const registry = await connectMcpServers({
+    roots: [workspace],
+    userConfigPath: path.join(workspace, "missing-mcp.json"),
+    approveServer: async () => true,
+  })
+  try {
+    assert.equal(registry.tools.length, 1)
+    assert.equal(registry.tools[0].name, "mcp.project_1_local_docs.echo")
+    assert.equal(JSON.stringify(registry.tools).includes(secret), false)
+    assert.equal(registry.tools[0].inputSchema.properties.apiKey.const, "[SECRET OMITTED]")
+    const output = await registry.call(registry.tools[0].name, { query: "hello" })
+    assert.match(output.output, /hello/u)
+    assert.match(output.output, /\[SECRET OMITTED\]/u)
+    assert.doesNotMatch(output.output, new RegExp(secret, "u"))
+  } finally {
+    await registry.close()
+  }
+})
+
+test("routes agent MCP calls through server discovery and asks before invocation", async (t) => {
+  const { workspace, config } = await fixture(t)
+  const secret = "mcp-agent-private-value-4309"
+  process.env.DREYZE_MCP_TEST_SECRET = secret
+  t.after(() => { delete process.env.DREYZE_MCP_TEST_SECRET })
+  await mkdir(path.join(workspace, ".dreyze"), { recursive: true })
+  const serverScript = fileURLToPath(new URL("../fixtures/mcp-stdio-server.mjs", import.meta.url))
+  await writeFile(path.join(workspace, ".dreyze", "mcp.json"), JSON.stringify({
+    mcpServers: {
+      local_docs: {
+        command: process.execPath,
+        args: [serverScript],
+        cwd: ".",
+        env: { MCP_ECHO_SECRET: "${DREYZE_MCP_TEST_SECRET}" },
+      },
+    },
+  }))
+  const store = createSessionStore(workspace, config)
+  const session = await store.create("dreyze/test-model", "build")
+  session.messages.push({ role: "user", content: "Look up project guidance." })
+  const prompts = []
+  let calls = 0
+  const result = await runAgentTask({
+    config: { url: "https://moonfacet.example", cookie: "session" },
+    catalog: { models: [], defaultModel: "dreyze/test-model" },
+    session,
+    store,
+    roots: [workspace],
+    workspace,
+    question: async (prompt) => { prompts.push(prompt); return "y" },
+    onOutput: () => {},
+    fetchImpl: async (_url, init) => {
+      calls++
+      const requestBody = JSON.parse(init.body)
+      if (calls === 1) {
+        assert.equal(requestBody.mcpTools[0].name, "mcp.project_1_local_docs.echo")
+        return Response.json({
+          type: "tool",
+          name: "mcp.project_1_local_docs.echo",
+          input: { query: "project setup" },
+        })
+      }
+      const observation = requestBody.messages.at(-1).content
+      assert.match(observation, /project setup/u)
+      assert.match(observation, /\[SECRET OMITTED\]/u)
+      assert.doesNotMatch(observation, new RegExp(secret, "u"))
+      return Response.json({ type: "final", content: "The configured tool returned the project setup information." })
+    },
+  })
+  assert.equal(result.final, "The configured tool returned the project setup information.")
+  assert.equal(calls, 2)
+  assert.equal(prompts.length, 2)
+  assert.match(prompts[0], /Запустить MCP сервер/u)
+  assert.match(prompts[1], /Вызвать внешний MCP инструмент/u)
+  assert.ok(session.messages.some((message) => message.content.startsWith("Tool result (mcp.project_1_local_docs.echo):")))
 })
 
 test("validates local image signatures and keeps image bytes out of saved session messages", async (t) => {
@@ -539,7 +638,7 @@ test("runs the CLI when invoked through the symlink npm creates for its binary",
   await symlink(cli, command, "file")
   const child = spawnSync(command, ["--version"], { encoding: "utf8" })
   assert.equal(child.status, 0, child.stderr)
-  assert.equal(child.stdout, "DreyzeCode 0.4.2\n")
+  assert.equal(child.stdout, "DreyzeCode 0.5.0\n")
 })
 
 test("help documents image input in both one-shot and interactive modes", async () => {

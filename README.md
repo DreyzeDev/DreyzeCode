@@ -26,6 +26,7 @@ for the account password in the terminal.
 dreyzecode --json doctor
 dreyzecode models list
 dreyzecode skills list
+dreyzecode mcp list
 dreyzecode run "Inspect the project and fix the failing check"
 dreyzecode run "Describe the UI and suggest improvements" --image ./screenshot.png
 dreyzecode --continue
@@ -66,6 +67,40 @@ agent turn, then the model reads a matching skill file before using it.
 `dreyzecode skills list` displays skills without requiring login. Additional
 approved project folders can contain their own `.dreyze/skills` directory.
 
+## MCP servers
+
+DreyzeCode can connect to MCP servers over `stdio`, Streamable HTTP, or legacy
+SSE. Configure project servers in `.dreyze/mcp.json` or user-wide servers in
+`%APPDATA%/DreyzeCode/mcp.json` on Windows and
+`$XDG_CONFIG_HOME/dreyze-code/mcp.json` (default `~/.config/dreyze-code/mcp.json`)
+on Linux and macOS. Check the visible server names with `dreyzecode mcp list`.
+
+Example project configuration:
+
+```json
+{
+  "mcpServers": {
+    "docs": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "./docs"],
+      "cwd": "."
+    },
+    "remote-tools": {
+      "type": "http",
+      "url": "https://mcp.example.com/mcp",
+      "headers": { "Authorization": "Bearer ${MCP_ACCESS_TOKEN}" }
+    }
+  }
+}
+```
+
+Set environment variables before starting DreyzeCode; `${NAME}` references in
+`env`, `args`, and HTTP headers are expanded locally. Values are not sent to the
+model. Build asks before starting each configured server and before every MCP
+tool call. Tool descriptions, schemas, and results are treated as untrusted
+data. `--yes` approves server launches and MCP calls for unattended work.
+Plan mode does not expose MCP tools.
+
 Sessions are stored under the user's DreyzeCode configuration directory, keyed
 by the canonical project path. An interrupted write or command is recorded
 before it starts. On restart the CLI reports an unknown outcome and asks the
@@ -83,12 +118,14 @@ read-only same-origin escape hatch restricted to `/api/` paths.
 
 - `login`, `logout`, `doctor`, `models list`, `sessions list`, `sessions show`
 - `skills list` for project-local capabilities
+- `mcp list` for configured local and remote MCP servers
 - Interactive chat, `run`, `--continue`, `--session`, `--model`, and `--mode`
 - Local tools: list/read/search, image input, create/copy/move/write/edit/delete
   files, create folders, run approved commands, search the web using the
   account's monthly search allowance, ask the user, and start a read-only
   research subagent in Build mode. Web search is read-only and available in
-  both Build and Plan modes.
+  both Build and Plan modes. MCP tools are available in Build mode after
+  server and per-call approval.
 - `api get` for read-only diagnostics
 
 The CLI uses `/api/code/agent/turn` and `/api/code/v1/models` on the configured
