@@ -55,6 +55,11 @@ paths, not image bytes; images are checked against the allowed project folders
 each time they are sent. Each image is limited to 2.9 MB and a message to 7 MB
 total.
 
+Interactive mode renders sent prompts and model replies in separate chat
+panels. Enter `/help` for the command list: `/model`, `/mode`, `/attach`,
+`/detach`, `/theme`, `/status`, `/sessions`, `/resume`, `/new`, `/clear`, and
+`/exit`. Prefix a message with `//` when it should start with a literal `/`.
+
 The agent follows project guidance from `AGENTS.md` files and
 `.dreyze/instructions.md`. Nested `AGENTS.md` files are supplied with their
 relative paths so the agent can apply the closest relevant rules. Discovery

@@ -266,7 +266,7 @@ export async function connectMcpServers({ roots, userConfigPath, approveServer, 
     let transport
     let stderrTail = ""
     try {
-      client = new Client({ name: "dreyzecode", version: "0.5.3" })
+      client = new Client({ name: "dreyzecode", version: "0.5.4" })
       if (server.type === "stdio") {
         transport = new StdioClientTransport({
           command: server.command,

@@ -9,7 +9,7 @@ import { access, chmod, copyFile, lstat, mkdir, open, readdir, readFile, realpat
 import { fileURLToPath } from "node:url"
 import { connectMcpServers, listConfiguredMcpServers } from "./mcp-client.mjs"
 
-export const VERSION = "0.5.3"
+export const VERSION = "0.5.4"
 const MAX_STEPS = 80
 const MAX_HISTORY = 40
 const MAX_MESSAGE_CHARS = 24_000
@@ -27,6 +27,21 @@ const MAX_PROJECT_SKILL_CHARS = 12_000
 const IGNORED_SEARCH_DIRS = new Set([".git", ".next", ".turbo", ".venv", "venv", "build", "dist", "node_modules", "target", "vendor", "coverage"])
 const MUTATING_TOOLS = new Set(["create_directory", "copy_file", "move_file", "write_file", "edit_file", "delete_file", "run_command", "delegate_task"])
 const PLAN_TOOLS = new Set(["list_files", "read_file", "search_text", "web_search", "ask_user"])
+export const SLASH_COMMANDS = Object.freeze([
+  { name: "help", usage: "/help", description: "показать команды" },
+  { name: "mode", usage: "/mode build|plan", description: "переключить режим работы" },
+  { name: "model", usage: "/model [название]", description: "выбрать модель или показать каталог" },
+  { name: "attach", usage: "/attach <путь>", description: "добавить изображение к следующему сообщению" },
+  { name: "detach", usage: "/detach", description: "убрать вложения следующего сообщения" },
+  { name: "theme", usage: "/theme purple|blue|system", description: "изменить оформление терминала" },
+  { name: "status", usage: "/status", description: "показать текущую сессию и проект" },
+  { name: "sessions", usage: "/sessions", description: "показать последние сессии проекта" },
+  { name: "resume", usage: "/resume [ID]", description: "открыть сессию по ID или последнюю" },
+  { name: "new", usage: "/new", description: "начать новую сессию" },
+  { name: "clear", usage: "/clear", description: "очистить экран, сохранив историю" },
+  { name: "exit", usage: "/exit", description: "завершить работу" },
+])
+const SLASH_COMMAND_NAMES = new Set([...SLASH_COMMANDS.map(({ name }) => name), "models", "quit"])
 const TOOLS = new Set([
   "list_files", "read_file", "search_text", "create_directory", "copy_file", "move_file",
   "write_file", "edit_file", "delete_file", "run_command", "ask_user", "delegate_task", "web_search",
@@ -135,6 +150,50 @@ export function parseArgs(args) {
   return result
 }
 
+export function parseSlashCommand(input) {
+  if (typeof input !== "string") return null
+  const trimmed = input.trim()
+  if (!trimmed.startsWith("/") || trimmed.startsWith("//")) return null
+  const match = /^\/([a-z][a-z0-9-]*)(?:\s+([\s\S]*))?$/iu.exec(trimmed)
+  if (!match) return null
+  return { name: match[1].toLowerCase(), argument: match[2] ?? "" }
+}
+
+function safeTerminalText(value) {
+  return String(value)
+    .replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "")
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/gu, "�")
+    .replace(/\r\n?/gu, "\n")
+}
+
+export function formatChatMessage(title, content, requestedWidth = 76) {
+  const width = Math.max(32, Math.min(100, Number.isInteger(requestedWidth) ? requestedWidth : 76))
+  const safeTitle = safeTerminalText(title).replace(/\n/gu, " ").slice(0, width - 10) || "DreyzeCode"
+  const contentWidth = width - 4
+  const header = `╭─ ${safeTitle} ${"─".repeat(Math.max(2, width - safeTitle.length - 5))}╮`
+  const wrapped = safeTerminalText(content).split("\n").flatMap((line) => {
+    if (!line) return [""]
+    const output = []
+    let current = ""
+    for (const word of line.split(/\s+/u)) {
+      if (!current) current = word
+      else if (current.length + word.length + 1 <= contentWidth) current += ` ${word}`
+      else {
+        output.push(current)
+        current = word
+      }
+      while (current.length > contentWidth) {
+        output.push(current.slice(0, contentWidth))
+        current = current.slice(contentWidth)
+      }
+    }
+    output.push(current)
+    return output
+  })
+  const lines = wrapped.map((line) => `│ ${line.padEnd(contentWidth)} │`)
+  return [header, ...lines, `╰${"─".repeat(width - 2)}╯`].join("\n")
+}
+
 function printHelp() {
   stdout.write(`DreyzeCode ${VERSION} — локальный агент разработки Dreyze\n\n` +
     `Использование:\n` +
@@ -153,7 +212,7 @@ function printHelp() {
     `  dreyzecode api get /api/...            безопасный GET к API Dreyze\n\n` +
     `Параметры: --model ID, --mode build|plan, --add-dir PATH, --image PATH (повторяемый), --session ID, --json, --yes\n` +
     `В Build изменения файлов и команды требуют подтверждения. Plan разрешает только чтение.\n` +
-    `В интерактивном режиме: /mode build|plan, /model ID, /attach PATH, /theme purple|blue|system, /exit.\n`)
+    `В интерактивном режиме: /help, /mode, /model, /attach, /detach, /theme, /status, /sessions, /resume, /new, /clear, /exit.\n`)
 }
 
 function jsonOut(value) {
@@ -1090,6 +1149,17 @@ function accent(value) {
   return (text) => color ? `${color}${text}\u001b[0m` : text
 }
 
+function writeChatMessage(title, content, color = (text) => text) {
+  const panel = formatChatMessage(title, content, stdout.columns || 76).split("\n")
+  stdout.write(`\n${color(panel[0])}\n${panel.slice(1, -1).join("\n")}\n${color(panel.at(-1))}\n`)
+}
+
+function printSlashHelp(color) {
+  const rows = SLASH_COMMANDS.map(({ usage, description }) => `${usage.padEnd(25)} ${description}`)
+  rows.push(`${"//текст".padEnd(25)} отправить модели текст, начинающийся с /`)
+  writeChatMessage("Команды DreyzeCode", rows.join("\n"), color)
+}
+
 function printHumanModels(catalog) {
   for (const model of catalog.models) stdout.write(`${model.id === catalog.defaultModel ? "* " : "  "}${model.id}\t${model.name}\t${model.group}${model.supportsImages ? "\timages" : ""}\n`)
 }
@@ -1156,7 +1226,11 @@ async function runPrompt(prompt, options, config, catalog, session, store, roots
   const result = await runAgentTask({
     config, catalog, session, store, roots, workspace, yes: options.yes,
     question: questioner.ask,
-    onOutput: (text) => { if (!options.json) stdout.write(`${text}\n`) },
+    onOutput: (text) => {
+      if (options.json) return
+      if (typeof options.chatColor === "function") writeChatMessage(`DreyzeCode · ${session.model} · ${session.mode}`, text, options.chatColor)
+      else stdout.write(`${text}\n`)
+    },
   })
   if (options.json) jsonOut({ ok: true, session: { id: session.id, model: session.model, mode: session.mode }, ...result })
   return result
@@ -1204,11 +1278,21 @@ export async function resumeInteractiveSession({
   return true
 }
 
-async function interactive(options, config, catalog, session, store, roots, workspace, questioner) {
+async function interactive(options, config, catalog, initialSession, store, roots, workspace, questioner) {
+  let session = initialSession
   let theme = await readTheme()
   let color = accent(theme)
   let pendingImagePaths = [...(options.imagePaths ?? [])]
-  stdout.write(`${color("DreyzeCode")} · ${session.model} · ${session.mode}\nКоманды: /mode build|plan, /model ID, /attach PATH, /theme purple|blue|system, /exit\n`)
+  const printSessionHeader = () => {
+    const mode = session.mode === "plan" ? "Plan · только чтение" : "Build · изменения с подтверждением"
+    writeChatMessage("DreyzeCode", `Проект: ${workspace}\nМодель: ${session.model}\nРежим: ${mode}`, color)
+    stdout.write("Напишите задачу или введите /help.\n")
+  }
+  const printModels = () => {
+    const rows = catalog.models.map((model) => `${model.id === session.model ? "●" : "○"} ${model.name} · ${model.id}${model.supportsImages ? " · images" : ""}`)
+    writeChatMessage("Модели Dreyze", rows.join("\n") || "Каталог моделей пуст.", color)
+  }
+  printSessionHeader()
   const recovered = await recoverPendingAction(session, store)
   const resumed = await resumeInteractiveSession({
     options,
@@ -1220,51 +1304,129 @@ async function interactive(options, config, catalog, session, store, roots, work
     workspace,
     questioner,
     recovered,
+    onOutput: (text) => writeChatMessage(`DreyzeCode · ${session.model} · ${session.mode}`, text, color),
   })
   if (options.continuing && session.pendingQuestion && !resumed) return
   while (true) {
-    const input = await questioner.ask(`\n${color("Вы")} > `)
+    const input = await questioner.ask(`\n${color("❯")} `)
     if (!input) { if (!stdin.isTTY) break; continue }
-    if (["/exit", "/quit"].includes(input.trim())) break
-    if (input.startsWith("/mode ")) {
-      const mode = input.slice(6).trim()
-      if (!["build", "plan"].includes(mode)) stdout.write("Режим: build или plan.\n")
-      else { session.mode = mode; await store.save(session); stdout.write(`Режим: ${mode}.\n`) }
-      continue
-    }
-    if (input.startsWith("/model ")) {
-      const requested = input.slice(7).trim()
-      const selected = catalog.models.find((model) => model.id === requested || model.name.toLowerCase() === requested.toLowerCase())
-      if (!selected) stdout.write("Модель не найдена. Список: dreyzecode models list.\n")
-      else { session.model = selected.id; await store.save(session); stdout.write(`Модель: ${selected.name}.\n`) }
-      continue
-    }
-    if (input.startsWith("/attach ")) {
-      const imagePath = input.slice(8).trim()
-      if (!imagePath) stdout.write("Укажите путь: /attach ./photo.png\n")
-      else if (pendingImagePaths.length >= MAX_IMAGES_PER_MESSAGE) stdout.write(`К сообщению можно прикрепить не больше ${MAX_IMAGES_PER_MESSAGE} изображений.\n`)
-      else {
-        pendingImagePaths.push(imagePath)
-        stdout.write(`Изображение добавлено к следующему сообщению: ${imagePath}\n`)
+    const parsedCommand = parseSlashCommand(input)
+    if (parsedCommand) {
+      const { name, argument } = parsedCommand
+      const value = argument.trim()
+      if (!SLASH_COMMAND_NAMES.has(name)) {
+        writeChatMessage("Неизвестная команда", `/${name} не найдена. Введите /help, чтобы посмотреть команды DreyzeCode.`, color)
+        continue
       }
-      continue
-    }
-    if (input.startsWith("/theme ")) {
-      const theme = input.slice(7).trim()
-      if (!["purple", "blue", "system"].includes(theme)) stdout.write("Тема: purple, blue или system.\n")
-      else {
+      if (name === "exit" || name === "quit") break
+      if (name === "help") {
+        printSlashHelp(color)
+        continue
+      }
+      if (name === "mode") {
+        if (!value) writeChatMessage("Режим", `Сейчас: ${session.mode}. Используйте /mode build или /mode plan.`, color)
+        else if (!["build", "plan"].includes(value.toLowerCase())) writeChatMessage("Режим", "Выберите build или plan.", color)
+        else {
+          session.mode = value.toLowerCase()
+          await store.save(session)
+          writeChatMessage("Режим обновлён", session.mode === "plan" ? "Plan · только чтение" : "Build · изменения с подтверждением", color)
+        }
+        continue
+      }
+      if (name === "model" || name === "models") {
+        if (!value) {
+          printModels()
+          continue
+        }
+        const requested = value.replace(/^("|')(.*)\1$/su, "$2")
+        const selected = catalog.models.find((model) => model.id.toLowerCase() === requested.toLowerCase() || model.name.toLowerCase() === requested.toLowerCase())
+        if (!selected) writeChatMessage("Модель не найдена", `Не нашёл «${requested}». Введите /model, чтобы открыть каталог.`, color)
+        else {
+          session.model = selected.id
+          await store.save(session)
+          writeChatMessage("Модель обновлена", `${selected.name} · ${selected.id}`, color)
+        }
+        continue
+      }
+      if (name === "attach") {
+        const imagePath = value.replace(/^("|')(.*)\1$/su, "$2")
+        if (!imagePath) writeChatMessage("Вложение", "Использование: /attach ./путь/к/изображению.png", color)
+        else if (pendingImagePaths.length >= MAX_IMAGES_PER_MESSAGE) writeChatMessage("Вложение", `К сообщению можно добавить не больше ${MAX_IMAGES_PER_MESSAGE} изображений.`, color)
+        else {
+          pendingImagePaths.push(imagePath)
+          writeChatMessage("Вложение добавлено", `${basename(imagePath)} будет отправлено со следующим сообщением.`, color)
+        }
+        continue
+      }
+      if (name === "detach") {
+        const count = pendingImagePaths.length
+        pendingImagePaths = []
+        writeChatMessage("Вложения очищены", count ? `Убрано файлов: ${count}.` : "Нет вложений для следующего сообщения.", color)
+        continue
+      }
+      if (name === "theme") {
+        if (!value) {
+          writeChatMessage("Тема", `Сейчас: ${theme}. Варианты: purple, blue, system.`, color)
+          continue
+        }
+        const requestedTheme = value.toLowerCase()
+        if (!["purple", "blue", "system"].includes(requestedTheme)) {
+          writeChatMessage("Тема", "Выберите purple, blue или system.", color)
+          continue
+        }
+        theme = requestedTheme
         await mkdir(configRoot, { recursive: true, mode: 0o700 })
         await writeFile(join(configRoot, "theme.json"), `${JSON.stringify({ preset: theme })}\n`, { mode: 0o600 })
         color = accent(theme)
-        stdout.write(`Тема сохранена: ${theme}.\n`)
+        writeChatMessage("Тема сохранена", theme, color)
+        continue
       }
-      continue
+      if (name === "status") {
+        const attachments = pendingImagePaths.length ? pendingImagePaths.map(basename).join(", ") : "нет"
+        writeChatMessage("Состояние сессии", `ID: ${session.id}\nМодель: ${session.model}\nРежим: ${session.mode}\nПроект: ${workspace}\nВложения: ${attachments}`, color)
+        continue
+      }
+      if (name === "sessions") {
+        const sessions = await store.list(10)
+        if (!sessions.some((item) => item.id === session.id)) {
+          sessions.unshift({ id: session.id, model: session.model, mode: session.mode, title: session.title ?? null, parentSessionId: session.parentSessionId ?? null, updatedAt: session.updatedAt, messages: session.messages.length })
+        }
+        const rows = sessions.slice(0, 10).map((item) => `${item.id === session.id ? "● текущая" : "○ сессия"} · ${item.id}\n  ${item.title || item.model} · ${item.mode} · ${item.messages} сообщений`)
+        writeChatMessage("Последние сессии", rows.join("\n") || "Сессий пока нет.", color)
+        continue
+      }
+      if (name === "resume") {
+        try {
+          session = value ? await store.load(value) : await store.latest()
+          pendingImagePaths = []
+          writeChatMessage("Сессия открыта", `${session.id}\n${session.model} · ${session.mode}`, color)
+        } catch {
+          writeChatMessage("Сессия не найдена", value ? `Не удалось открыть ${value}.` : "В этом проекте ещё нет сохранённых сессий.", color)
+        }
+        continue
+      }
+      if (name === "new") {
+        session = await store.create(session.model || catalog.defaultModel, session.mode || "build")
+        pendingImagePaths = []
+        await store.save(session)
+        writeChatMessage("Новая сессия", `${session.id}\n${session.model} · ${session.mode}`, color)
+        continue
+      }
+      if (name === "clear") {
+        if (stdout.isTTY) stdout.write("\u001b[2J\u001b[H")
+        printSessionHeader()
+        writeChatMessage("История сохранена", "Экран очищен. Сессия и её история не изменились.", color)
+        continue
+      }
     }
+    const prompt = input.startsWith("//") ? input.slice(1) : input
+    const attachmentNote = pendingImagePaths.length ? `\n\nВложения: ${pendingImagePaths.map(basename).join(", ")}` : ""
+    writeChatMessage("Вы", `${prompt}${attachmentNote}`, color)
     try {
-      await runPrompt(input, { ...options, imagePaths: pendingImagePaths }, config, catalog, session, store, roots, workspace, questioner)
+      await runPrompt(prompt, { ...options, imagePaths: pendingImagePaths, chatColor: color }, config, catalog, session, store, roots, workspace, questioner)
       pendingImagePaths = []
     }
-    catch (error) { reportError(error, false) }
+    catch (error) { writeChatMessage("Ошибка", error instanceof Error ? error.message : "Не удалось выполнить задачу.", color) }
   }
 }
 

@@ -10,10 +10,12 @@ import {
   apiGet,
   executeTool,
   fetchModelCatalog,
+  formatChatMessage,
   isSensitivePath,
   loadProjectInstructions,
   loadProjectSkills,
   parseArgs,
+  parseSlashCommand,
   redactSecrets,
   recoverPendingAction,
   resumeInteractiveSession,
@@ -40,6 +42,33 @@ test("parses the product command surface with global flags before and after comm
   assert.equal(parseArgs(["skills", "list"]).command, "skills")
   assert.equal(parseArgs(["--continue"]).continuing, true)
   assert.deepEqual(parseArgs(["--image", "./first.png", "--image=./second.webp", "run", "Describe photos"]).imagePaths, ["./first.png", "./second.webp"])
+})
+
+test("parses DreyzeCode slash commands with multiword arguments and literal slash escape", () => {
+  assert.deepEqual(parseSlashCommand("/MoDe plan"), { name: "mode", argument: "plan" })
+  assert.deepEqual(parseSlashCommand('/model "Dreyze Opus 5.5"'), { name: "model", argument: '"Dreyze Opus 5.5"' })
+  assert.equal(parseSlashCommand("//tmp/project"), null)
+  assert.equal(parseSlashCommand("Build a storefront"), null)
+})
+
+test("formats chat messages as terminal-safe panels", () => {
+  const panel = formatChatMessage("DreyzeCode", "Hello\u001b[31m red\u001b[0m\nNext line", 40)
+  const lines = panel.split("\n")
+  assert.match(lines[0], /^╭─ DreyzeCode/u)
+  assert.match(panel, /│ Hello red/u)
+  assert.match(panel, /│ Next line/u)
+  assert.doesNotMatch(panel, /\u001b/u)
+  assert.equal(lines[0].length, 40)
+  assert.ok(lines.slice(1, -1).every((line) => line.length === 40))
+  assert.equal(lines.at(-1).length, 40)
+})
+
+test("wraps long chat output to the available terminal width", () => {
+  const panel = formatChatMessage("Assistant", "A long sentence that should wrap across a narrow chat panel.", 40)
+  const lines = panel.split("\n")
+  assert.ok(lines.slice(1, -1).length > 1)
+  assert.ok(lines.slice(1, -1).every((line) => line.length === 40))
+  assert.match(panel, /should wrap/u)
 })
 
 test("runs authenticated web search as a read-only agent tool", async (t) => {
@@ -750,7 +779,7 @@ test("runs the CLI when invoked through the symlink npm creates for its binary",
   await symlink(cli, command, "file")
   const child = spawnSync(command, ["--version"], { encoding: "utf8" })
   assert.equal(child.status, 0, child.stderr)
-  assert.equal(child.stdout, "DreyzeCode 0.5.3\n")
+  assert.equal(child.stdout, "DreyzeCode 0.5.4\n")
 })
 
 test("help documents image input in both one-shot and interactive modes", async () => {
@@ -758,7 +787,7 @@ test("help documents image input in both one-shot and interactive modes", async 
   const child = spawnSync(process.execPath, [cli, "--help"], { encoding: "utf8" })
   assert.equal(child.status, 0, child.stderr)
   assert.match(child.stdout, /--image PATH/u)
-  assert.match(child.stdout, /\/attach PATH/u)
+  assert.match(child.stdout, /\/help.*\/attach/u)
   assert.match(child.stdout, /skills list/u)
 })
 
