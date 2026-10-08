@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url"
 import {
   createSessionStore,
   apiGet,
+  completeSlashInput,
   executeTool,
   fetchModelCatalog,
   formatChatMessage,
@@ -49,6 +50,15 @@ test("parses DreyzeCode slash commands with multiword arguments and literal slas
   assert.deepEqual(parseSlashCommand('/model "Dreyze Opus 5.5"'), { name: "model", argument: '"Dreyze Opus 5.5"' })
   assert.equal(parseSlashCommand("//tmp/project"), null)
   assert.equal(parseSlashCommand("Build a storefront"), null)
+})
+
+test("completes slash commands and their mode, theme, and model arguments", () => {
+  const catalog = { models: [{ id: "dreyze/opus" }, { id: "dreyze/sonnet" }] }
+  assert.deepEqual(completeSlashInput("/hel"), [["/help"], "/hel"])
+  assert.deepEqual(completeSlashInput("/mode p"), [["/mode plan"], "/mode p"])
+  assert.deepEqual(completeSlashInput("/theme b"), [["/theme blue"], "/theme b"])
+  assert.deepEqual(completeSlashInput("/model dreyze/o", catalog), [["/model dreyze/opus"], "/model dreyze/o"])
+  assert.deepEqual(completeSlashInput("//tmp"), [[], "//tmp"])
 })
 
 test("formats chat messages as terminal-safe panels", () => {
@@ -795,7 +805,7 @@ test("runs the CLI when invoked through the symlink npm creates for its binary",
   await symlink(cli, command, "file")
   const child = spawnSync(command, ["--version"], { encoding: "utf8" })
   assert.equal(child.status, 0, child.stderr)
-  assert.equal(child.stdout, "DreyzeCode 0.5.5\n")
+  assert.equal(child.stdout, "DreyzeCode 0.5.6\n")
 })
 
 test("help documents image input in both one-shot and interactive modes", async () => {

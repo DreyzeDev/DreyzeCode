@@ -58,7 +58,7 @@ each time they are sent. Each image is limited to 2.9 MB and a message to 7 MB
 total.
 
 Interactive mode renders sent prompts and model replies in separate chat
-panels. Enter `/help` for the command list: `/model`, `/mode`, `/attach`,
+panels. Press Tab after `/` to complete commands and available models. Enter `/help` for the command list: `/model`, `/mode`, `/attach`,
 `/detach`, `/theme`, `/status`, `/sessions`, `/resume`, `/new`, `/clear`, and
 `/exit`. Prefix a message with `//` when it should start with a literal `/`.
 

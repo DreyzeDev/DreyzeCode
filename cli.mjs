@@ -9,7 +9,7 @@ import { access, chmod, copyFile, lstat, mkdir, open, readdir, readFile, realpat
 import { fileURLToPath } from "node:url"
 import { connectMcpServers, listConfiguredMcpServers } from "./mcp-client.mjs"
 
-export const VERSION = "0.5.5"
+export const VERSION = "0.5.6"
 const MAX_STEPS = 80
 const MAX_HISTORY = 40
 const MAX_MESSAGE_CHARS = 24_000
@@ -157,6 +157,29 @@ export function parseSlashCommand(input) {
   const match = /^\/([a-z][a-z0-9-]*)(?:\s+([\s\S]*))?$/iu.exec(trimmed)
   if (!match) return null
   return { name: match[1].toLowerCase(), argument: match[2] ?? "" }
+}
+
+export function completeSlashInput(line, catalog = { models: [] }) {
+  if (typeof line !== "string" || !line.startsWith("/") || line.startsWith("//")) return [[], line]
+  const match = /^\/([a-z][a-z0-9-]*)(?:\s+([\s\S]*))?$/iu.exec(line)
+  const names = [...SLASH_COMMANDS.map(({ name }) => `/${name}`), "/models", "/quit"]
+  if (!match || match[2] === undefined) {
+    return [names.filter((candidate) => candidate.toLowerCase().startsWith(line.toLowerCase())), line]
+  }
+  const name = match[1].toLowerCase()
+  const argument = match[2]
+  if (/\s/u.test(argument.trim())) return [[], line]
+  const values = name === "mode"
+    ? ["build", "plan"]
+    : name === "theme"
+      ? ["purple", "blue", "system"]
+      : name === "model" || name === "models"
+        ? (Array.isArray(catalog?.models) ? catalog.models.map((model) => model.id).filter((id) => typeof id === "string") : [])
+        : []
+  const prefix = `/${name} `
+  const candidates = values.map((value) => `${prefix}${value}`)
+    .filter((candidate) => candidate.toLowerCase().startsWith(line.toLowerCase()))
+  return [candidates, line]
 }
 
 function safeTerminalText(value) {
@@ -1105,9 +1128,14 @@ export async function loadProjectSkills(roots) {
   return skills
 }
 
-function promptInterface(jsonMode = false) {
+function promptInterface(jsonMode = false, catalog = { models: [] }) {
   const output = jsonMode ? stderr : stdout
-  const rl = createInterface({ input: stdin, output, terminal: Boolean(stdin.isTTY) })
+  const rl = createInterface({
+    input: stdin,
+    output,
+    terminal: Boolean(stdin.isTTY),
+    completer: (line) => completeSlashInput(line, catalog),
+  })
   return {
     ask: (prompt) => new Promise((resolvePromise) => {
       if (!stdin.isTTY) return resolvePromise(null)
@@ -1509,7 +1537,7 @@ export async function runCli(args = process.argv.slice(2)) {
   }
   if (options.model) session.model = catalog.models.find((model) => model.id === options.model || model.name.toLowerCase() === options.model.toLowerCase()).id
   if (options.mode) session.mode = options.mode
-  const questioner = promptInterface(options.json)
+  const questioner = promptInterface(options.json, catalog)
   try {
     if (options.command === "run" || options.positionals.length > 0) {
       return await runPrompt(options.positionals.join(" "), options, config, catalog, session, store, roots, workspace, questioner)
