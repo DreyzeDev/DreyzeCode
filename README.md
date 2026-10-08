@@ -25,6 +25,7 @@ for the account password in the terminal.
 ```sh
 dreyzecode --json doctor
 dreyzecode models list
+dreyzecode skills list
 dreyzecode run "Inspect the project and fix the failing check"
 dreyzecode run "Describe the UI and suggest improvements" --image ./screenshot.png
 dreyzecode --continue
@@ -59,6 +60,12 @@ skips generated and dependency folders, symbolic links, oversized files, and
 secret values; the total project-guidance context is capped at 24,000
 characters.
 
+Project skills live at `.dreyze/skills/<name>/SKILL.md`. Add YAML frontmatter
+with `name` and `description`; DreyzeCode sends that small index with each
+agent turn, then the model reads a matching skill file before using it.
+`dreyzecode skills list` displays skills without requiring login. Additional
+approved project folders can contain their own `.dreyze/skills` directory.
+
 Sessions are stored under the user's DreyzeCode configuration directory, keyed
 by the canonical project path. An interrupted write or command is recorded
 before it starts. On restart the CLI reports an unknown outcome and asks the
@@ -75,6 +82,7 @@ read-only same-origin escape hatch restricted to `/api/` paths.
 ## Current command contract
 
 - `login`, `logout`, `doctor`, `models list`, `sessions list`, `sessions show`
+- `skills list` for project-local capabilities
 - Interactive chat, `run`, `--continue`, `--session`, `--model`, and `--mode`
 - Local tools: list/read/search, image input, create/copy/move/write/edit/delete
   files, create folders, run approved commands, ask the user, and start a

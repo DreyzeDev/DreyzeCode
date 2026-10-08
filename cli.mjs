@@ -8,7 +8,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import { access, chmod, copyFile, lstat, mkdir, open, readdir, readFile, realpath, rename, stat, unlink, writeFile } from "node:fs/promises"
 import { fileURLToPath } from "node:url"
 
-export const VERSION = "0.3.1"
+export const VERSION = "0.4.0"
 const MAX_STEPS = 80
 const MAX_HISTORY = 40
 const MAX_MESSAGE_CHARS = 24_000
@@ -21,6 +21,8 @@ const MAX_IMAGES_PER_MESSAGE = 6
 const MAX_PROJECT_INSTRUCTION_FILES = 40
 const MAX_PROJECT_INSTRUCTION_CHARS = 24_000
 const MAX_PROJECT_INSTRUCTION_FILE_BYTES = 32_000
+const MAX_PROJECT_SKILLS = 40
+const MAX_PROJECT_SKILL_CHARS = 12_000
 const IGNORED_SEARCH_DIRS = new Set([".git", ".next", ".turbo", ".venv", "venv", "build", "dist", "node_modules", "target", "vendor", "coverage"])
 const MUTATING_TOOLS = new Set(["create_directory", "copy_file", "move_file", "write_file", "edit_file", "delete_file", "run_command", "delegate_task"])
 const PLAN_TOOLS = new Set(["list_files", "read_file", "search_text", "ask_user"])
@@ -83,7 +85,7 @@ export async function resolveWorkspacePath(rawPath, roots, { mustExist = false, 
 }
 
 export function parseArgs(args) {
-  const commands = new Set(["login", "logout", "doctor", "models", "sessions", "api", "run", "chat", "help"])
+  const commands = new Set(["login", "logout", "doctor", "models", "sessions", "skills", "api", "run", "chat", "help"])
   const result = { command: "interactive", positionals: [], addDirs: [], imagePaths: [], json: false, yes: false, continuing: false }
   let index = 0
   if (args[0] === "--help" || args[0] === "-h" || args[0] === "help") return { ...result, command: "help" }
@@ -146,6 +148,7 @@ function printHelp() {
     `  dreyzecode models list                 показать доступные модели\n` +
     `  dreyzecode sessions list               найти локальные сессии проекта\n` +
     `  dreyzecode sessions show <id>          вывести локальную сессию\n` +
+    `  dreyzecode skills list                 показать skills проекта\n` +
     `  dreyzecode api get /api/...            безопасный GET к API Dreyze\n\n` +
     `Параметры: --model ID, --mode build|plan, --add-dir PATH, --image PATH (повторяемый), --session ID, --json, --yes\n` +
     `В Build изменения файлов и команды требуют подтверждения. Plan разрешает только чтение.\n` +
@@ -666,12 +669,12 @@ async function agentMessages(session, roots, catalog) {
   }))
 }
 
-async function callAgent(config, session, fetchImpl = fetch, projectInstructions = [], roots = [], catalog = { models: [] }) {
+async function callAgent(config, session, fetchImpl = fetch, projectInstructions = [], projectSkills = [], roots = [], catalog = { models: [] }) {
   const messages = await agentMessages(session, roots, catalog)
   const response = await fetchImpl(new URL("/api/code/agent/turn", config.url), {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json", Cookie: config.cookie },
-    body: JSON.stringify({ model: session.model, mode: session.mode, messages, projectInstructions }),
+    body: JSON.stringify({ model: session.model, mode: session.mode, messages, projectInstructions, projectSkills }),
     redirect: "error",
     signal: AbortSignal.timeout(160_000),
   })
@@ -704,10 +707,11 @@ export async function runAgentTask({ config, catalog, session, store, roots, wor
   await recoverPendingAction(session, store)
   for (let step = 0; step < MAX_STEPS; step++) {
     const projectInstructions = await loadProjectInstructions(roots)
+    const projectSkills = await loadProjectSkills(roots)
     const stopWaiting = startWaitIndicator(step)
     let action
     try {
-      action = await callAgent(config, session, fetchImpl, projectInstructions, roots, catalog)
+      action = await callAgent(config, session, fetchImpl, projectInstructions, projectSkills, roots, catalog)
     } finally {
       stopWaiting()
     }
@@ -845,6 +849,73 @@ export async function loadProjectInstructions(roots) {
     last.content = `${last.content.slice(0, Math.max(0, last.content.length - shortenBy))}${marker}`
   }
   return files
+}
+
+export async function loadProjectSkills(roots) {
+  const skills = []
+  let remaining = MAX_PROJECT_SKILL_CHARS
+  const seen = new Set()
+  for (const root of roots) {
+    if (skills.length >= MAX_PROJECT_SKILLS || remaining <= 0) break
+    const candidateRoot = join(root, ".dreyze", "skills")
+    const rootInfo = await lstat(candidateRoot).catch(() => null)
+    if (!rootInfo?.isDirectory() || rootInfo.isSymbolicLink()) continue
+    const skillsRoot = await realpath(candidateRoot).catch(() => null)
+    if (!skillsRoot || !within(root, skillsRoot)) continue
+    const entries = await readdir(skillsRoot, { withFileTypes: true }).catch(() => [])
+    entries.sort((a, b) => a.name.localeCompare(b.name))
+    for (const entry of entries) {
+      if (skills.length >= MAX_PROJECT_SKILLS || remaining <= 0) break
+      if (!entry.isDirectory() || !entry.name.trim() || entry.name.length > 80 || /[\u0000-\u001f\u007f]/u.test(entry.name)) continue
+      const directory = join(skillsRoot, entry.name)
+      const dirInfo = await lstat(directory).catch(() => null)
+      if (!dirInfo?.isDirectory() || dirInfo.isSymbolicLink()) continue
+      const skillFile = join(directory, "SKILL.md")
+      const fileInfo = await lstat(skillFile).catch(() => null)
+      if (!fileInfo?.isFile() || fileInfo.isSymbolicLink() || fileInfo.size < 1 || fileInfo.size > MAX_PROJECT_INSTRUCTION_FILE_BYTES) continue
+      const canonicalFile = await realpath(skillFile).catch(() => null)
+      if (!canonicalFile || !within(root, canonicalFile) || seen.has(canonicalFile)) continue
+      const content = (await readFile(canonicalFile, "utf8").catch(() => "")).replace(/^\uFEFF/u, "")
+      const frontMatter = content.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/u)?.[1] ?? ""
+      const scalar = (key) => {
+        const lines = frontMatter.split(/\r?\n/u)
+        const index = lines.findIndex((line) => new RegExp(`^\\s*${key}\\s*:`, "iu").test(line))
+        if (index < 0) return ""
+        const value = lines[index].replace(new RegExp(`^\\s*${key}\\s*:\\s*`, "iu"), "").trim()
+        if (!value) return ""
+        if (/^[>|][+-]?$/u.test(value)) {
+          const block = []
+          for (let lineIndex = index + 1; lineIndex < lines.length; lineIndex++) {
+            const line = lines[lineIndex]
+            if (line.trim() && !/^\s/u.test(line)) break
+            if (line.trim()) block.push(line.trim())
+          }
+          return block.join(" ")
+        }
+        if (value.startsWith('"') && value.endsWith('"')) {
+          try { return JSON.parse(value) } catch { return value.slice(1, -1) }
+        }
+        if (value.startsWith("'") && value.endsWith("'")) return value.slice(1, -1).replace(/''/gu, "'")
+        return value
+      }
+      const name = redactSecrets(scalar("name") || entry.name).slice(0, 80)
+      const description = redactSecrets(scalar("description")).slice(0, 800)
+      const rootLabel = roots.indexOf(root) === 0 ? "." : `--add-dir ${roots.indexOf(root) + 1}`
+      const path = relative(root, canonicalFile).split(sep).join("/")
+      const skill = { name, path: `${rootLabel}/${path}`, description }
+      const size = skill.name.length + skill.path.length + skill.description.length
+      if (size > remaining) {
+        const shortenedDescription = skill.description.slice(0, Math.max(0, remaining - skill.name.length - skill.path.length))
+        skill.description = shortenedDescription
+      }
+      const finalSize = skill.name.length + skill.path.length + skill.description.length
+      if (!finalSize || finalSize > remaining) continue
+      seen.add(canonicalFile)
+      skills.push(skill)
+      remaining -= finalSize
+    }
+  }
+  return skills
 }
 
 function promptInterface(jsonMode = false) {
@@ -1102,6 +1173,15 @@ export async function runCli(args = process.argv.slice(2)) {
     if (subcommand === "list") return listSessions(options, workspace)
     if (subcommand === "show") return showSession(options, workspace)
     throw new Error("Использование: dreyzecode sessions list|show ID")
+  }
+  if (options.command === "skills") {
+    const subcommand = options.positionals[0]
+    if (subcommand && subcommand !== "list") throw new Error("Использование: dreyzecode skills list")
+    const skills = await loadProjectSkills(await canonicalRoots(workspace, options.addDirs))
+    if (options.json) jsonOut({ ok: true, skills })
+    else if (!skills.length) stdout.write("В разрешённых папках проекта skills не найдены.\n")
+    else for (const skill of skills) stdout.write(`${skill.name}\t${skill.path}\t${skill.description}\n`)
+    return
   }
   if (!config) throw Object.assign(new Error("Сначала войдите: dreyzecode login."), { code: "AUTH_REQUIRED" })
   if (options.command === "api") {

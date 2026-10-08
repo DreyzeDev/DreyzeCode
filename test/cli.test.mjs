@@ -12,6 +12,7 @@ import {
   fetchModelCatalog,
   isSensitivePath,
   loadProjectInstructions,
+  loadProjectSkills,
   parseArgs,
   redactSecrets,
   recoverPendingAction,
@@ -35,6 +36,7 @@ test("parses the product command surface with global flags before and after comm
   assert.deepEqual(parseArgs(["--json", "doctor"]).command, "doctor")
   assert.deepEqual(parseArgs(["--model", "dreyze/model", "--mode", "plan", "run", "Review", "this"]).positionals, ["Review", "this"])
   assert.equal(parseArgs(["sessions", "list"]).command, "sessions")
+  assert.equal(parseArgs(["skills", "list"]).command, "skills")
   assert.equal(parseArgs(["--continue"]).continuing, true)
   assert.deepEqual(parseArgs(["--image", "./first.png", "--image=./second.webp", "run", "Describe photos"]).imagePaths, ["./first.png", "./second.webp"])
 })
@@ -126,6 +128,65 @@ test("loads root and nested project guides while skipping generated and linked f
   assert.doesNotMatch(guides.find((guide) => guide.path === "./AGENTS.md").content, /123456789012345678901234567890/u)
   assert.equal(guides.some((guide) => guide.content.includes("dependency guide")), false)
   assert.equal(guides.some((guide) => guide.content.includes("linked files")), false)
+})
+
+test("discovers project skills from their safe metadata without loading skill bodies", async (t) => {
+  const { workspace } = await fixture(t)
+  const skillDir = path.join(workspace, ".dreyze", "skills", "interface-review")
+  await mkdir(skillDir, { recursive: true })
+  await writeFile(path.join(skillDir, "SKILL.md"), [
+    "---",
+    "name: Interface Review",
+    "description: Review layout, responsive behavior, and accessibility.",
+    "---",
+    "",
+    "Do a focused review and include concrete file references.",
+  ].join("\n"))
+  const releaseDir = path.join(workspace, ".dreyze", "skills", "release")
+  await mkdir(releaseDir, { recursive: true })
+  await writeFile(path.join(releaseDir, "SKILL.md"), [
+    "---",
+    "name: Release Checklist",
+    "description: >-",
+    "  Check release gates",
+    "  before publishing.",
+    "---",
+    "",
+    "The complete skill body stays local until the model selects this skill.",
+  ].join("\n"))
+
+  const skills = await loadProjectSkills([workspace])
+  assert.deepEqual(skills, [
+    {
+      name: "Interface Review",
+      path: "./.dreyze/skills/interface-review/SKILL.md",
+      description: "Review layout, responsive behavior, and accessibility.",
+    },
+    {
+      name: "Release Checklist",
+      path: "./.dreyze/skills/release/SKILL.md",
+      description: "Check release gates before publishing.",
+    },
+  ])
+})
+
+test("lists workspace skills without requiring a Dreyze login", async (t) => {
+  const { workspace, config } = await fixture(t)
+  const skillDir = path.join(workspace, ".dreyze", "skills", "release")
+  await mkdir(skillDir, { recursive: true })
+  await writeFile(path.join(skillDir, "SKILL.md"), "---\nname: Release\ndescription: Release checklist.\n---\n")
+  const cli = fileURLToPath(new URL("../cli.mjs", import.meta.url))
+  const child = spawnSync(process.execPath, [cli, "--json", "skills", "list"], {
+    cwd: workspace,
+    env: { ...process.env, XDG_CONFIG_HOME: config },
+    encoding: "utf8",
+  })
+  assert.equal(child.status, 0, child.stderr)
+  assert.deepEqual(JSON.parse(child.stdout).skills, [{
+    name: "Release",
+    path: "./.dreyze/skills/release/SKILL.md",
+    description: "Release checklist.",
+  }])
 })
 
 test("rejects traversal, symlink escapes, and sensitive reads", async (t) => {
@@ -241,6 +302,9 @@ test("stores a write intent before execution and carries the result into the nex
   session.messages.push({ role: "user", content: "Create the requested file." })
   await store.save(session)
   await writeFile(path.join(workspace, "AGENTS.md"), "Use semicolons in new TypeScript files.")
+  const skillDirectory = path.join(workspace, ".dreyze", "skills", "code")
+  await mkdir(skillDirectory, { recursive: true })
+  await writeFile(path.join(skillDirectory, "SKILL.md"), "---\nname: Code\ndescription: Follow project coding patterns.\n---\nRead before editing.")
   const save = store.save.bind(store)
   let pendingSaved = false
   store.save = async (value) => {
@@ -265,6 +329,11 @@ test("stores a write intent before execution and carries the result into the nex
       assert.equal(init.redirect, "error")
       assert.equal(request.messages.length > 0, true)
       assert.deepEqual(request.projectInstructions, [{ path: "./AGENTS.md", content: "Use semicolons in new TypeScript files." }])
+      assert.deepEqual(request.projectSkills, [{
+        name: "Code",
+        path: "./.dreyze/skills/code/SKILL.md",
+        description: "Follow project coding patterns.",
+      }])
       if (calls === 1) {
         return Response.json({ type: "tool", name: "write_file", input: { path: "created.txt", content: "hello" } })
       }
@@ -423,7 +492,7 @@ test("runs the CLI when invoked through the symlink npm creates for its binary",
   await symlink(cli, command, "file")
   const child = spawnSync(command, ["--version"], { encoding: "utf8" })
   assert.equal(child.status, 0, child.stderr)
-  assert.equal(child.stdout, "DreyzeCode 0.3.1\n")
+  assert.equal(child.stdout, "DreyzeCode 0.4.0\n")
 })
 
 test("help documents image input in both one-shot and interactive modes", async () => {
@@ -432,6 +501,7 @@ test("help documents image input in both one-shot and interactive modes", async 
   assert.equal(child.status, 0, child.stderr)
   assert.match(child.stdout, /--image PATH/u)
   assert.match(child.stdout, /\/attach PATH/u)
+  assert.match(child.stdout, /skills list/u)
 })
 
 test("the raw API escape hatch rejects paths that normalize outside /api", async () => {
