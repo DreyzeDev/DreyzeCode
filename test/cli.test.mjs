@@ -916,7 +916,7 @@ test("runs the CLI when invoked through the symlink npm creates for its binary",
   await symlink(cli, command, "file")
   const child = spawnSync(command, ["--version"], { encoding: "utf8" })
   assert.equal(child.status, 0, child.stderr)
-  assert.equal(child.stdout, "DreyzeCode 0.5.10\n")
+  assert.equal(child.stdout, "DreyzeCode 0.5.11\n")
 })
 
 test("help documents image input in both one-shot and interactive modes", async () => {

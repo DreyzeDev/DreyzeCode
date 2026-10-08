@@ -9,7 +9,7 @@ import { access, chmod, copyFile, lstat, mkdir, open, readdir, readFile, realpat
 import { fileURLToPath } from "node:url"
 import { connectMcpServers, listConfiguredMcpServers } from "./mcp-client.mjs"
 
-export const VERSION = "0.5.10"
+export const VERSION = "0.5.11"
 const MAX_STEPS = 80
 const MAX_HISTORY = 40
 const MAX_MESSAGE_CHARS = 24_000
@@ -1634,6 +1634,7 @@ async function interactive(options, config, catalog, initialSession, store, root
         await mkdir(configRoot, { recursive: true, mode: 0o700 })
         await writeFile(join(configRoot, "theme.json"), `${JSON.stringify({ preset: theme })}\n`, { mode: 0o600 })
         color = accent(theme)
+        questioner.setPaletteColor?.(color)
         writeChatMessage("Тема сохранена", theme, color)
         continue
       }
