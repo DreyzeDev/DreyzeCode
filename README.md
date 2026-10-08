@@ -26,6 +26,7 @@ for the account password in the terminal.
 dreyzecode --json doctor
 dreyzecode models list
 dreyzecode run "Inspect the project and fix the failing check"
+dreyzecode run "Describe the UI and suggest improvements" --image ./screenshot.png
 dreyzecode --continue
 dreyzecode --model dreyze/model-id --mode plan run "Review the authentication flow"
 dreyzecode --add-dir ../shared-library run "Compare the shared library API"
@@ -43,6 +44,13 @@ inside the approved project; moving the project root or moving a folder into
 itself is blocked. `--yes` approves requested changes, shell commands, and
 subagent work for unattended runs; use it only when the task and workspace are
 trusted.
+
+Attach PNG, JPEG, or WebP images with one or more `--image PATH` options. In an
+interactive session, use `/attach PATH` before sending the next prompt. The
+selected model must advertise image support. A session stores validated local
+paths, not image bytes; images are checked against the allowed project folders
+each time they are sent. Each image is limited to 2.9 MB and a message to 7 MB
+total.
 
 The agent follows project guidance from `AGENTS.md` files and
 `.dreyze/instructions.md`. Nested `AGENTS.md` files are supplied with their
@@ -68,9 +76,9 @@ read-only same-origin escape hatch restricted to `/api/` paths.
 
 - `login`, `logout`, `doctor`, `models list`, `sessions list`, `sessions show`
 - Interactive chat, `run`, `--continue`, `--session`, `--model`, and `--mode`
-- Local tools: list/read/search, create/copy/move/write/edit/delete files,
-  create folders, run approved commands, ask the user, and start a read-only
-  research subagent in Build mode
+- Local tools: list/read/search, image input, create/copy/move/write/edit/delete
+  files, create folders, run approved commands, ask the user, and start a
+  read-only research subagent in Build mode
 - `api get` for read-only diagnostics
 
 The CLI uses `/api/code/agent/turn` and `/api/code/v1/models` on the configured

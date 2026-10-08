@@ -8,13 +8,16 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import { access, chmod, copyFile, lstat, mkdir, open, readdir, readFile, realpath, rename, stat, unlink, writeFile } from "node:fs/promises"
 import { fileURLToPath } from "node:url"
 
-export const VERSION = "0.2.0"
+export const VERSION = "0.3.0"
 const MAX_STEPS = 80
 const MAX_HISTORY = 40
 const MAX_MESSAGE_CHARS = 24_000
 const MAX_TOOL_OUTPUT = 12_000
 const MAX_READ_BYTES = 1_000_000
 const MAX_WRITE_BYTES = 500_000
+const MAX_IMAGE_BYTES = 2_900_000
+const MAX_IMAGE_TOTAL_BYTES = 7_000_000
+const MAX_IMAGES_PER_MESSAGE = 6
 const MAX_PROJECT_INSTRUCTION_FILES = 40
 const MAX_PROJECT_INSTRUCTION_CHARS = 24_000
 const MAX_PROJECT_INSTRUCTION_FILE_BYTES = 32_000
@@ -81,7 +84,7 @@ export async function resolveWorkspacePath(rawPath, roots, { mustExist = false, 
 
 export function parseArgs(args) {
   const commands = new Set(["login", "logout", "doctor", "models", "sessions", "api", "run", "chat", "help"])
-  const result = { command: "interactive", positionals: [], addDirs: [], json: false, yes: false, continuing: false }
+  const result = { command: "interactive", positionals: [], addDirs: [], imagePaths: [], json: false, yes: false, continuing: false }
   let index = 0
   if (args[0] === "--help" || args[0] === "-h" || args[0] === "help") return { ...result, command: "help" }
   if (args[0] === "--version" || args[0] === "-v") return { ...result, command: "version" }
@@ -108,6 +111,13 @@ export function parseArgs(args) {
     } else if (arg === "--add-dir") {
       result.addDirs.push(args[++index])
       if (!result.addDirs.at(-1)) throw new Error("--add-dir требует путь.")
+    } else if (arg === "--image") {
+      result.imagePaths.push(args[++index])
+      if (!result.imagePaths.at(-1)) throw new Error("--image требует путь к файлу изображения.")
+    } else if (arg.startsWith("--image=")) {
+      const imagePath = arg.slice("--image=".length)
+      if (!imagePath) throw new Error("--image требует путь к файлу изображения.")
+      result.imagePaths.push(imagePath)
     } else if (arg === "--session") {
       result.sessionID = args[++index]
       if (!result.sessionID) throw new Error("--session требует ID.")
@@ -128,6 +138,7 @@ function printHelp() {
     `Использование:\n` +
     `  dreyzecode [параметры]                 интерактивная сессия\n` +
     `  dreyzecode run "задача"                 выполнить задачу\n` +
+    `  dreyzecode run "опиши фото" --image ./photo.png\n` +
     `  dreyzecode --continue                  продолжить последнюю сессию\n` +
     `  dreyzecode login [--url URL] [--remote] войти через браузер\n` +
     `  dreyzecode logout                      завершить сессию CLI\n` +
@@ -136,7 +147,7 @@ function printHelp() {
     `  dreyzecode sessions list               найти локальные сессии проекта\n` +
     `  dreyzecode sessions show <id>          вывести локальную сессию\n` +
     `  dreyzecode api get /api/...            безопасный GET к API Dreyze\n\n` +
-    `Параметры: --model ID, --mode build|plan, --add-dir PATH, --session ID, --json, --yes\n` +
+    `Параметры: --model ID, --mode build|plan, --add-dir PATH, --image PATH (повторяемый), --session ID, --json, --yes\n` +
     `В Build изменения файлов и команды требуют подтверждения. Plan разрешает только чтение.\n` +
     `В интерактивном режиме: /mode build|plan, /model ID, /theme purple|blue|system, /exit.\n`)
 }
@@ -253,7 +264,15 @@ export function createSessionStore(workspace, root = configRoot, { updateLatestP
       if (raw.length > 5_000_000) throw new Error("Файл сессии превышает допустимый размер.")
       const data = JSON.parse(raw)
       if (!data || data.id !== id || data.workspace !== workspace || !Array.isArray(data.messages)) throw new Error("Файл сессии повреждён или относится к другому проекту.")
-      data.messages = data.messages.filter((message) => message && ["user", "assistant"].includes(message.role) && typeof message.content === "string").slice(-MAX_HISTORY)
+      data.messages = data.messages
+        .filter((message) => message && ["user", "assistant"].includes(message.role) && typeof message.content === "string")
+        .map((message) => {
+          const imagePaths = Array.isArray(message.imagePaths)
+            ? message.imagePaths.filter((value) => typeof value === "string" && value.length <= 4_096).slice(0, MAX_IMAGES_PER_MESSAGE)
+            : []
+          return { role: message.role, content: message.content, ...(imagePaths.length ? { imagePaths } : {}) }
+        })
+        .slice(-MAX_HISTORY)
       return data
     },
     async latest() {
@@ -306,9 +325,9 @@ export function createSessionStore(workspace, root = configRoot, { updateLatestP
   }
 }
 
-function appendMessage(session, role, content) {
+function appendMessage(session, role, content, imagePaths = []) {
   const safe = String(content).slice(0, MAX_MESSAGE_CHARS)
-  session.messages.push({ role, content: safe })
+  session.messages.push({ role, content: safe, ...(role === "user" && imagePaths.length ? { imagePaths } : {}) })
   if (session.messages.length > MAX_HISTORY) session.messages.splice(1, session.messages.length - MAX_HISTORY)
   const total = session.messages.reduce((sum, item) => sum + item.content.length, 0)
   while (total > 130_000 && session.messages.length > 2) session.messages.splice(1, 1)
@@ -336,6 +355,56 @@ async function fileDetails(pathname) {
   const content = await readFile(pathname, "utf8")
   if (content.includes("\0")) throw new Error("Бинарный файл нельзя читать или редактировать как текст.")
   return content
+}
+
+function imageMimeType(bytes) {
+  if (bytes.length >= 8 && bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) return "image/png"
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "image/jpeg"
+  if (bytes.length >= 12 && bytes.toString("ascii", 0, 4) === "RIFF" && bytes.toString("ascii", 8, 12) === "WEBP") return "image/webp"
+  return null
+}
+
+async function readLocalImage(rawPath, roots) {
+  const candidate = await resolveWorkspacePath(rawPath, roots, { mustExist: true })
+  const pathname = await realpath(candidate)
+  if (!roots.some((root) => within(root, pathname))) throw new Error("Изображение находится вне папок, разрешённых для этой сессии.")
+  const info = await stat(pathname)
+  if (!info.isFile()) throw new Error("Для вложения выберите обычный файл изображения.")
+  if (info.size < 1 || info.size > MAX_IMAGE_BYTES) throw new Error(`Размер изображения должен быть от 1 байта до ${MAX_IMAGE_BYTES} байт.`)
+  const bytes = await readFile(pathname)
+  if (bytes.length !== info.size || bytes.length > MAX_IMAGE_BYTES) throw new Error("Изображение изменилось во время чтения или превышает лимит.")
+  const type = imageMimeType(bytes)
+  if (!type) throw new Error("Поддерживаются изображения PNG, JPEG и WebP.")
+  return { path: pathname, name: basename(pathname), type, size: bytes.length, bytes }
+}
+
+export async function validateImagePaths(rawPaths, roots) {
+  if (!Array.isArray(rawPaths) || rawPaths.length > MAX_IMAGES_PER_MESSAGE) {
+    throw new Error(`Можно прикрепить не больше ${MAX_IMAGES_PER_MESSAGE} изображений к одному сообщению.`)
+  }
+  const references = []
+  const seen = new Set()
+  let totalBytes = 0
+  for (const rawPath of rawPaths) {
+    const image = await readLocalImage(rawPath, roots)
+    if (seen.has(image.path)) continue
+    seen.add(image.path)
+    totalBytes += image.size
+    if (totalBytes > MAX_IMAGE_TOTAL_BYTES) throw new Error(`Общий размер изображений не должен превышать ${MAX_IMAGE_TOTAL_BYTES} байт.`)
+    references.push({ path: image.path, name: image.name, type: image.type, size: image.size })
+  }
+  return references
+}
+
+async function providerImage(reference, roots) {
+  const image = await readLocalImage(reference.path, roots)
+  return {
+    id: randomUUID(),
+    name: image.name,
+    type: image.type,
+    size: image.size,
+    data: `data:${image.type};base64,${image.bytes.toString("base64")}`,
+  }
 }
 
 async function resolveDesktopRoot() {
@@ -571,11 +640,38 @@ function truncateOutput(value) {
   return text.length <= MAX_TOOL_OUTPUT ? text : `${text.slice(0, MAX_TOOL_OUTPUT)}\n[Вывод сокращён]`
 }
 
-async function callAgent(config, session, fetchImpl = fetch, projectInstructions = []) {
+async function agentMessages(session, roots, catalog) {
+  const messages = session.messages.slice(-MAX_HISTORY)
+  const latestImageIndex = messages.findLastIndex((message) => Array.isArray(message.imagePaths) && message.imagePaths.length > 0)
+  const imagePaths = latestImageIndex >= 0 ? messages[latestImageIndex].imagePaths : []
+  if (imagePaths.length && imagePaths.length > MAX_IMAGES_PER_MESSAGE) throw new Error("В сохранённой сессии слишком много изображений.")
+  const selectedModel = catalog.models.find((model) => model.id === session.model)
+  if (imagePaths.length && !selectedModel?.supportsImages) {
+    throw Object.assign(new Error("Выбранная модель не принимает изображения. Выберите модель с поддержкой images командой /model или параметром --model."), { code: "MODEL_DOES_NOT_SUPPORT_IMAGES" })
+  }
+  const attachments = []
+  let totalBytes = 0
+  for (const path of imagePaths) {
+    const attachment = await providerImage({ path }, roots)
+    totalBytes += attachment.size
+    if (totalBytes > MAX_IMAGE_TOTAL_BYTES) throw new Error(`Общий размер изображений не должен превышать ${MAX_IMAGE_TOTAL_BYTES} байт.`)
+    attachments.push(attachment)
+  }
+  return Promise.all(messages.map(async (message, index) => {
+    if (!Array.isArray(message.imagePaths) || !message.imagePaths.length) return { role: message.role, content: message.content }
+    if (index !== latestImageIndex) {
+      return { role: message.role, content: `${message.content}\n[Ранее приложенное изображение опущено из контекста. При необходимости попроси прикрепить его повторно.]` }
+    }
+    return { role: message.role, content: message.content, attachments }
+  }))
+}
+
+async function callAgent(config, session, fetchImpl = fetch, projectInstructions = [], roots = [], catalog = { models: [] }) {
+  const messages = await agentMessages(session, roots, catalog)
   const response = await fetchImpl(new URL("/api/code/agent/turn", config.url), {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json", Cookie: config.cookie },
-    body: JSON.stringify({ model: session.model, mode: session.mode, messages: session.messages.slice(-MAX_HISTORY), projectInstructions }),
+    body: JSON.stringify({ model: session.model, mode: session.mode, messages, projectInstructions }),
     redirect: "error",
     signal: AbortSignal.timeout(160_000),
   })
@@ -611,7 +707,7 @@ export async function runAgentTask({ config, catalog, session, store, roots, wor
     const stopWaiting = startWaitIndicator(step)
     let action
     try {
-      action = await callAgent(config, session, fetchImpl, projectInstructions)
+      action = await callAgent(config, session, fetchImpl, projectInstructions, roots, catalog)
     } finally {
       stopWaiting()
     }
@@ -800,7 +896,7 @@ function accent(value) {
 }
 
 function printHumanModels(catalog) {
-  for (const model of catalog.models) stdout.write(`${model.id === catalog.defaultModel ? "* " : "  "}${model.id}\t${model.name}\t${model.group}\n`)
+  for (const model of catalog.models) stdout.write(`${model.id === catalog.defaultModel ? "* " : "  "}${model.id}\t${model.name}\t${model.group}${model.supportsImages ? "\timages" : ""}\n`)
 }
 
 export async function apiGet(config, pathname, jsonMode) {
@@ -852,11 +948,15 @@ async function runPrompt(prompt, options, config, catalog, session, store, roots
   await recoverPendingAction(session, store)
   session.model = options.model || session.model || catalog.defaultModel
   session.mode = options.mode || session.mode || "build"
+  const imagePaths = await validateImagePaths(options.imagePaths ?? [], roots)
+  if (imagePaths.length && !catalog.models.find((model) => model.id === session.model)?.supportsImages) {
+    throw Object.assign(new Error("Выбранная модель не принимает изображения. Выберите модель с поддержкой images командой /model или параметром --model."), { code: "MODEL_DOES_NOT_SUPPORT_IMAGES" })
+  }
   const pendingQuestion = session.pendingQuestion
   session.pendingQuestion = null
   if (options.addDirs.length) appendMessage(session, "user", `Дополнительные папки, явно разрешённые для этой сессии: ${roots.slice(1).join(", ")}. Используй абсолютные пути внутри них, если это необходимо.`)
-  if (pendingQuestion) appendMessage(session, "user", `Ответ на уточнение «${pendingQuestion}»: ${prompt}`)
-  else appendMessage(session, "user", prompt)
+  if (pendingQuestion) appendMessage(session, "user", `Ответ на уточнение «${pendingQuestion}»: ${prompt}`, imagePaths)
+  else appendMessage(session, "user", prompt, imagePaths)
   await store.save(session)
   const result = await runAgentTask({
     config, catalog, session, store, roots, workspace, yes: options.yes,
@@ -912,7 +1012,8 @@ export async function resumeInteractiveSession({
 async function interactive(options, config, catalog, session, store, roots, workspace, questioner) {
   let theme = await readTheme()
   let color = accent(theme)
-  stdout.write(`${color("DreyzeCode")} · ${session.model} · ${session.mode}\nКоманды: /mode build|plan, /model ID, /theme purple|blue|system, /exit\n`)
+  let pendingImagePaths = [...(options.imagePaths ?? [])]
+  stdout.write(`${color("DreyzeCode")} · ${session.model} · ${session.mode}\nКоманды: /mode build|plan, /model ID, /attach PATH, /theme purple|blue|system, /exit\n`)
   const recovered = await recoverPendingAction(session, store)
   const resumed = await resumeInteractiveSession({
     options,
@@ -943,6 +1044,16 @@ async function interactive(options, config, catalog, session, store, roots, work
       else { session.model = selected.id; await store.save(session); stdout.write(`Модель: ${selected.name}.\n`) }
       continue
     }
+    if (input.startsWith("/attach ")) {
+      const imagePath = input.slice(8).trim()
+      if (!imagePath) stdout.write("Укажите путь: /attach ./photo.png\n")
+      else if (pendingImagePaths.length >= MAX_IMAGES_PER_MESSAGE) stdout.write(`К сообщению можно прикрепить не больше ${MAX_IMAGES_PER_MESSAGE} изображений.\n`)
+      else {
+        pendingImagePaths.push(imagePath)
+        stdout.write(`Изображение добавлено к следующему сообщению: ${imagePath}\n`)
+      }
+      continue
+    }
     if (input.startsWith("/theme ")) {
       const theme = input.slice(7).trim()
       if (!["purple", "blue", "system"].includes(theme)) stdout.write("Тема: purple, blue или system.\n")
@@ -954,7 +1065,10 @@ async function interactive(options, config, catalog, session, store, roots, work
       }
       continue
     }
-    try { await runPrompt(input, options, config, catalog, session, store, roots, workspace, questioner) }
+    try {
+      await runPrompt(input, { ...options, imagePaths: pendingImagePaths }, config, catalog, session, store, roots, workspace, questioner)
+      pendingImagePaths = []
+    }
     catch (error) { reportError(error, false) }
   }
 }

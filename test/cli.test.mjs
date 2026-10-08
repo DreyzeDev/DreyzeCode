@@ -18,6 +18,7 @@ import {
   resumeInteractiveSession,
   resolveWorkspacePath,
   runAgentTask,
+  validateImagePaths,
 } from "../cli.mjs"
 
 async function fixture(t) {
@@ -35,6 +36,67 @@ test("parses the product command surface with global flags before and after comm
   assert.deepEqual(parseArgs(["--model", "dreyze/model", "--mode", "plan", "run", "Review", "this"]).positionals, ["Review", "this"])
   assert.equal(parseArgs(["sessions", "list"]).command, "sessions")
   assert.equal(parseArgs(["--continue"]).continuing, true)
+  assert.deepEqual(parseArgs(["--image", "./first.png", "--image=./second.webp", "run", "Describe photos"]).imagePaths, ["./first.png", "./second.webp"])
+})
+
+test("validates local image signatures and keeps image bytes out of saved session messages", async (t) => {
+  const { workspace, config } = await fixture(t)
+  const image = path.join(workspace, "photo.png")
+  const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3])
+  await writeFile(image, signature)
+  const references = await validateImagePaths(["photo.png"], [workspace])
+  assert.deepEqual(references, [{ path: image, name: "photo.png", type: "image/png", size: signature.length }])
+
+  const session = await createSessionStore(workspace, config).create("dreyze/test-model", "build")
+  session.messages.push({ role: "user", content: "Describe this image.", imagePaths: references.map((item) => item.path) })
+  const store = createSessionStore(workspace, config)
+  await store.save(session)
+  const loaded = await store.load(session.id)
+  assert.deepEqual(loaded.messages[0].imagePaths, [image])
+  assert.equal(JSON.stringify(loaded).includes(signature.toString("base64")), false)
+  await assert.rejects(validateImagePaths(["../outside.png"], [workspace]), /вне папок/u)
+})
+
+test("sends an attached image to a vision model and refuses it for a text-only model", async (t) => {
+  const { workspace, config } = await fixture(t)
+  const imagePath = path.join(workspace, "screen.png")
+  const bytes = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 4, 5, 6])
+  await writeFile(imagePath, bytes)
+  const store = createSessionStore(workspace, config)
+  const session = await store.create("dreyze/vision", "build")
+  session.messages.push({ role: "user", content: "Что на изображении?", imagePaths: [imagePath] })
+  let calls = 0
+  const result = await runAgentTask({
+    config: { url: "https://moonfacet.example", cookie: "session" },
+    catalog: { models: [{ id: "dreyze/vision", supportsImages: true }], defaultModel: "dreyze/vision" },
+    session,
+    store,
+    roots: [workspace],
+    workspace,
+    question: async () => "",
+    fetchImpl: async (_url, init) => {
+      calls++
+      const request = JSON.parse(init.body)
+      assert.equal(request.messages.at(-1).attachments[0].type, "image/png")
+      assert.equal(request.messages.at(-1).attachments[0].size, bytes.length)
+      assert.equal(request.messages.at(-1).attachments[0].data, `data:image/png;base64,${bytes.toString("base64")}`)
+      return Response.json({ type: "final", content: "Вижу изображение." })
+    },
+  })
+  assert.equal(calls, 1)
+  assert.equal(result.final, "Вижу изображение.")
+
+  session.model = "dreyze/text"
+  await assert.rejects(runAgentTask({
+    config: { url: "https://moonfacet.example", cookie: "session" },
+    catalog: { models: [{ id: "dreyze/text", supportsImages: false }], defaultModel: "dreyze/text" },
+    session,
+    store,
+    roots: [workspace],
+    workspace,
+    question: async () => "",
+    fetchImpl: async () => { throw new Error("Text-only model must be rejected before fetch") },
+  }), /не принимает изображения/u)
 })
 
 test("loads root and nested project guides while skipping generated and linked folders", async (t) => {
@@ -361,7 +423,7 @@ test("runs the CLI when invoked through the symlink npm creates for its binary",
   await symlink(cli, command, "file")
   const child = spawnSync(command, ["--version"], { encoding: "utf8" })
   assert.equal(child.status, 0, child.stderr)
-  assert.equal(child.stdout, "DreyzeCode 0.2.0\n")
+  assert.equal(child.stdout, "DreyzeCode 0.3.0\n")
 })
 
 test("the raw API escape hatch rejects paths that normalize outside /api", async () => {
