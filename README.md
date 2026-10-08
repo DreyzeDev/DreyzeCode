@@ -45,7 +45,8 @@ own session remains available in the session list. Moving a folder renames it
 inside the approved project; moving the project root or moving a folder into
 itself is blocked. `--yes` approves requested changes, shell commands, and
 subagent work for unattended runs; use it only when the task and workspace are
-trusted.
+trusted. Identical consecutive tool calls are skipped; if the model keeps
+repeating the same call, DreyzeCode stops the run and saves the session.
 
 Attach PNG, JPEG, or WebP images with one or more `--image PATH` options. In an
 interactive session, use `/attach PATH` before sending the next prompt. The

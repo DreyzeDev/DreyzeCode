@@ -9,7 +9,7 @@ import { access, chmod, copyFile, lstat, mkdir, open, readdir, readFile, realpat
 import { fileURLToPath } from "node:url"
 import { connectMcpServers, listConfiguredMcpServers } from "./mcp-client.mjs"
 
-export const VERSION = "0.5.1"
+export const VERSION = "0.5.2"
 const MAX_STEPS = 80
 const MAX_HISTORY = 40
 const MAX_MESSAGE_CHARS = 24_000
@@ -741,6 +741,18 @@ function actionJSON(action) {
   return JSON.stringify(action)
 }
 
+function canonicalJSON(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJSON).join(",")}]`
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJSON(value[key])}`).join(",")}}`
+  }
+  return JSON.stringify(value)
+}
+
+function actionFingerprint(action) {
+  return createHash("sha256").update(`${action.name}\n${canonicalJSON(action.input)}`).digest("hex")
+}
+
 function redactMcpServerCommand(server) {
   let value = server.type === "stdio"
     ? `${server.command} (${server.args.length} arguments)`
@@ -787,6 +799,8 @@ export async function runAgentTask({ config, catalog, session, store, roots, wor
       onIssue: (issue) => stderr.write(`MCP: ${redactSecrets(issue)}\n`),
     })
     : { tools: [], has: () => false, describe: () => null, redact: (value) => redactSecrets(value), call: async () => { throw new Error("MCP инструменты недоступны.") }, close: async () => {} }
+  let previousActionFingerprint = ""
+  let repeatedActionCount = 0
   try {
     for (let step = 0; step < MAX_STEPS; step++) {
     const stopWaiting = startWaitIndicator(step)
@@ -804,6 +818,8 @@ export async function runAgentTask({ config, catalog, session, store, roots, wor
       return { final: action.content, steps: step + 1 }
     }
     if (action.type === "plan") {
+      previousActionFingerprint = ""
+      repeatedActionCount = 0
       appendMessage(session, "assistant", actionJSON(action))
       await store.save(session)
       onOutput(action.content)
@@ -815,8 +831,24 @@ export async function runAgentTask({ config, catalog, session, store, roots, wor
       throw Object.assign(new Error("Модель запросила неизвестный инструмент."), { code: "INVALID_TOOL_ACTION" })
     }
     if (session.mode === "plan" && !PLAN_TOOLS.has(action.name)) throw Object.assign(new Error("Plan разрешает только чтение файлов и поиск."), { code: "PLAN_MODE_READ_ONLY" })
+    const fingerprint = actionFingerprint(action)
+    if (fingerprint === previousActionFingerprint) repeatedActionCount++
+    else {
+      previousActionFingerprint = fingerprint
+      repeatedActionCount = 1
+    }
     appendMessage(session, "assistant", actionJSON(action))
     await store.save(session)
+    if (repeatedActionCount >= 2) {
+      const stopped = repeatedActionCount >= 3
+      const message = stopped
+        ? "Агент остановлен: он повторил один и тот же вызов инструмента три раза подряд. Предыдущий результат сохранён; измените запрос или продолжите с другой моделью."
+        : "Этот идентичный вызов уже был выполнен или отклонён непосредственно перед этим. Повторно он не запускался. Используй предыдущий результат или выбери другое действие."
+      appendMessage(session, "user", `Tool result (${action.name}): ${message}`)
+      await store.save(session)
+      if (stopped) throw Object.assign(new Error("Модель трижды повторила один и тот же вызов инструмента; цикл остановлен."), { code: "REPEATED_TOOL_ACTION" })
+      continue
+    }
     if (MUTATING_TOOLS.has(action.name) || mcpAction) {
       const approved = mcpAction
         ? await approveMcpTool(action, mcp, { yes, question })

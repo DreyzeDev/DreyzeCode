@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises"
+import { mkdtemp, mkdir, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { spawnSync } from "node:child_process"
@@ -515,6 +515,69 @@ test("keeps a task's project guide and skill snapshot stable across tool turns",
   assert.ok(session.messages.some((message) => message.content.includes("File created")))
 })
 
+test("does not execute a duplicate tool action and lets the model recover", async (t) => {
+  const { workspace, config } = await fixture(t)
+  const store = createSessionStore(workspace, config)
+  const session = await store.create("dreyze/test-model", "build")
+  session.messages.push({ role: "user", content: "Create a project folder." })
+  let calls = 0
+  let approvals = 0
+  const result = await runAgentTask({
+    config: { url: "https://moonfacet.example", cookie: "session" },
+    catalog: { models: [], defaultModel: "dreyze/test-model" },
+    session,
+    store,
+    roots: [workspace],
+    workspace,
+    question: async () => { approvals++; return "y" },
+    onOutput: () => {},
+    fetchImpl: async (_url, init) => {
+      calls++
+      const request = JSON.parse(init.body)
+      if (calls <= 2) {
+        const input = calls === 1
+          ? { path: "site", location: "workspace" }
+          : { location: "workspace", path: "site" }
+        return Response.json({ type: "tool", name: "create_directory", input })
+      }
+      assert.match(request.messages.at(-1).content, /Повторно он не запускался/u)
+      return Response.json({ type: "final", content: "Папка проекта уже создана." })
+    },
+  })
+
+  assert.equal(result.final, "Папка проекта уже создана.")
+  assert.equal(calls, 3)
+  assert.equal(approvals, 1)
+  assert.equal((await stat(path.join(workspace, "site"))).isDirectory(), true)
+})
+
+test("stops the agent after three identical consecutive tool calls", async (t) => {
+  const { workspace, config } = await fixture(t)
+  const store = createSessionStore(workspace, config)
+  const session = await store.create("dreyze/test-model", "build")
+  session.messages.push({ role: "user", content: "Create a project folder." })
+  let calls = 0
+  await assert.rejects(runAgentTask({
+    config: { url: "https://moonfacet.example", cookie: "session" },
+    catalog: { models: [], defaultModel: "dreyze/test-model" },
+    session,
+    store,
+    roots: [workspace],
+    workspace,
+    yes: true,
+    question: async () => "",
+    onOutput: () => {},
+    fetchImpl: async () => {
+      calls++
+      return Response.json({ type: "tool", name: "create_directory", input: { path: "site", location: "workspace" } })
+    },
+  }), (error) => error.code === "REPEATED_TOOL_ACTION")
+
+  assert.equal(calls, 3)
+  assert.equal((await stat(path.join(workspace, "site"))).isDirectory(), true)
+  assert.match(session.messages.at(-1).content, /Агент остановлен/u)
+})
+
 test("runs an isolated read-only subagent without changing the project's latest session", async (t) => {
   const { workspace, config } = await fixture(t)
   const store = createSessionStore(workspace, config)
@@ -659,7 +722,7 @@ test("runs the CLI when invoked through the symlink npm creates for its binary",
   await symlink(cli, command, "file")
   const child = spawnSync(command, ["--version"], { encoding: "utf8" })
   assert.equal(child.status, 0, child.stderr)
-  assert.equal(child.stdout, "DreyzeCode 0.5.1\n")
+  assert.equal(child.stdout, "DreyzeCode 0.5.2\n")
 })
 
 test("help documents image input in both one-shot and interactive modes", async () => {
