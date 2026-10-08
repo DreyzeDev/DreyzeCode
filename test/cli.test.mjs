@@ -24,6 +24,7 @@ import {
   resumeInteractiveSession,
   resolveWorkspacePath,
   runAgentTask,
+  slashCommandSuggestions,
   validateImagePaths,
 } from "../cli.mjs"
 import { connectMcpServers, listConfiguredMcpServers } from "../mcp-client.mjs"
@@ -74,6 +75,26 @@ test("completes slash commands and their mode, theme, and model arguments", () =
   assert.deepEqual(completeSlashInput("/theme b"), [["/theme blue"], "/theme b"])
   assert.deepEqual(completeSlashInput("/model dreyze/o", catalog), [["/model dreyze/opus"], "/model dreyze/o"])
   assert.deepEqual(completeSlashInput("//tmp"), [[], "//tmp"])
+})
+
+test("shows live slash suggestions for built-in commands and project skills", () => {
+  const catalog = {
+    skills: [
+      { commandName: "interface-review", name: "Interface Review", description: "Review the interface." },
+      { commandName: "проверка", name: "Проверка", description: "Проверить проект." },
+    ],
+  }
+  assert.deepEqual(slashCommandSuggestions("/hel", catalog), [
+    { name: "help", usage: "/help", description: "показать команды" },
+  ])
+  assert.deepEqual(slashCommandSuggestions("/interface", catalog), [
+    { name: "interface-review", usage: "/interface-review", description: "Review the interface." },
+  ])
+  assert.deepEqual(slashCommandSuggestions("/пров", catalog), [
+    { name: "проверка", usage: "/проверка", description: "Проверить проект." },
+  ])
+  assert.deepEqual(slashCommandSuggestions("/help later", catalog), [])
+  assert.deepEqual(slashCommandSuggestions("//tmp/project", catalog), [])
 })
 
 test("formats chat messages as terminal-safe panels", () => {
@@ -895,7 +916,7 @@ test("runs the CLI when invoked through the symlink npm creates for its binary",
   await symlink(cli, command, "file")
   const child = spawnSync(command, ["--version"], { encoding: "utf8" })
   assert.equal(child.status, 0, child.stderr)
-  assert.equal(child.stdout, "DreyzeCode 0.5.9\n")
+  assert.equal(child.stdout, "DreyzeCode 0.5.10\n")
 })
 
 test("help documents image input in both one-shot and interactive modes", async () => {
@@ -906,6 +927,7 @@ test("help documents image input in both one-shot and interactive modes", async 
   assert.match(child.stdout, /\/help.*\/attach/u)
   assert.match(child.stdout, /\/skills/u)
   assert.match(child.stdout, /<имя-папки>/u)
+  assert.match(child.stdout, /подсказки появляются при вводе/u)
   assert.match(child.stdout, /skills list/u)
 })
 

@@ -58,12 +58,12 @@ each time they are sent. Each image is limited to 2.9 MB and a message to 7 MB
 total.
 
 Interactive mode renders sent prompts and model replies in separate chat
-panels. A live status shows when the model or a local tool is working. Enter `/`
-to open the command palette or press Tab to complete commands, project skills,
-modes, themes, and available models. `/help` lists the built-in commands and
-project skills. Use `/skill-name task` to run a project skill with a task, or
-`/skills` to list skills. Prefix a message with `//` when it should start with
-a literal `/`.
+panels. A live status shows when the model or a local tool is working. Slash
+command suggestions update as you type. Enter `/` to open the full command
+palette or press Tab to complete commands, project skills, modes, themes, and
+available models. `/help` lists the built-in commands and project skills. Use
+`/skill-name task` to run a project skill with a task, or `/skills` to list
+skills. Prefix a message with `//` when it should start with a literal `/`.
 
 The agent follows project guidance from `AGENTS.md` files and
 `.dreyze/instructions.md`. Nested `AGENTS.md` files are supplied with their

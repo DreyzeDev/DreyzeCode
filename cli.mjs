@@ -9,7 +9,7 @@ import { access, chmod, copyFile, lstat, mkdir, open, readdir, readFile, realpat
 import { fileURLToPath } from "node:url"
 import { connectMcpServers, listConfiguredMcpServers } from "./mcp-client.mjs"
 
-export const VERSION = "0.5.9"
+export const VERSION = "0.5.10"
 const MAX_STEPS = 80
 const MAX_HISTORY = 40
 const MAX_MESSAGE_CHARS = 24_000
@@ -212,6 +212,31 @@ export function completeSlashInput(line, catalog = { models: [] }) {
   return [candidates, line]
 }
 
+export function slashCommandSuggestions(line, catalog = { models: [], skills: [] }) {
+  if (typeof line !== "string" || !line.startsWith("/") || line.startsWith("//") || /\s/u.test(line.slice(1))) return []
+  const commands = [
+    ...SLASH_COMMANDS.map(({ name, usage, description }) => ({ name, usage, description })),
+    { name: "models", usage: "/models", description: "показать доступные модели" },
+    { name: "quit", usage: "/quit", description: "завершить работу" },
+  ]
+  for (const skill of Array.isArray(catalog?.skills) ? catalog.skills : []) {
+    const name = skill?.commandName ?? skill?.name
+    if (typeof name !== "string" || !/^\p{L}[\p{L}\p{N}-]*$/iu.test(name)) continue
+    commands.push({
+      name,
+      usage: `/${name}`,
+      description: skill?.description || `проектный skill · ${skill?.name || name}`,
+    })
+  }
+  const seen = new Set()
+  return commands.filter((command) => {
+    const key = command.name.toLowerCase()
+    if (seen.has(key) || !command.usage.toLowerCase().startsWith(line.toLowerCase())) return false
+    seen.add(key)
+    return true
+  })
+}
+
 function safeTerminalText(value) {
   return String(value)
     .replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "")
@@ -313,7 +338,8 @@ function printHelp() {
     `  dreyzecode api get /api/...            безопасный GET к API Dreyze\n\n` +
     `Параметры: --model ID, --mode build|plan, --add-dir PATH, --image PATH (повторяемый), --session ID, --json, --yes\n` +
     `В Build изменения файлов и команды требуют подтверждения. Plan разрешает только чтение.\n` +
-    `В интерактивном режиме: / открывает команды; Tab дополняет команды, skills и модели.\n` +
+    `В интерактивном режиме: подсказки появляются при вводе /; Enter / открывает полный список.\n` +
+    `Tab дополняет команды, skills, режимы, темы и модели.\n` +
     `Команды: /help, /skills, /mode, /model, /attach, /detach, /theme, /status, /sessions, /resume, /new, /clear, /exit.\n` +
     `Проектный skill запускается как /<имя-папки> задача.\n`)
 }
@@ -1250,12 +1276,70 @@ function promptInterface(jsonMode = false, catalog = { models: [] }) {
     terminal: Boolean(stdin.isTTY),
     completer: (line) => completeSlashInput(line, catalog),
   })
+  let promptActive = false
+  let paletteVisible = false
+  let paletteAnchorRow = 0
+  let paletteColor = (text) => text
+
+  const moveToPalette = () => {
+    const position = rl.getCursorPos()
+    const rows = paletteAnchorRow - position.rows
+    if (rows > 0) output.write(`\u001b[${rows}B`)
+    else if (rows < 0) output.write(`\u001b[${-rows}A`)
+    output.write("\r")
+  }
+
+  const clearPalette = (submitted = false) => {
+    if (!paletteVisible || !output.isTTY) return
+    output.write("\u001b[s")
+    if (submitted) output.write("\r")
+    else moveToPalette()
+    output.write("\u001b[J\u001b[u")
+    paletteVisible = false
+  }
+
+  const drawPalette = () => {
+    if (!promptActive || !stdin.isTTY || !output.isTTY || rl.cursor !== rl.line.length) return
+    const suggestions = slashCommandSuggestions(rl.line, catalog)
+    if (!suggestions.length) return
+    const shown = suggestions.slice(0, 7)
+    const rows = shown.map(({ usage, description }) => `${usage.padEnd(24)} ${description}`)
+    if (suggestions.length > shown.length) rows.push(`… ещё ${suggestions.length - shown.length} команд · Tab — дополнить`)
+    const width = Math.max(32, Math.min(76, Number(output.columns) || 76))
+    const panel = formatChatMessage("Команды DreyzeCode", rows.join("\n"), width).split("\n")
+    const position = rl.getCursorPos()
+    paletteAnchorRow = position.rows + 1
+    output.write(`\u001b[s\r\n${panel.map((line, index) => index === 0 || index === panel.length - 1 ? paletteColor(line) : line).join("\r\n")}\u001b[u`)
+    paletteVisible = true
+  }
+
+  const onKeypress = (_character, key) => {
+    setImmediate(() => {
+      if (!promptActive) return
+      if (key?.name === "return" || key?.name === "enter") return
+      clearPalette()
+      drawPalette()
+    })
+  }
+  if (stdin.isTTY && output.isTTY) stdin.on("keypress", onKeypress)
+
   return {
     ask: (prompt) => new Promise((resolvePromise) => {
       if (!stdin.isTTY) return resolvePromise(null)
-      rl.question(prompt, resolvePromise)
+      promptActive = true
+      rl.question(prompt, (answer) => {
+        promptActive = false
+        clearPalette(true)
+        resolvePromise(answer)
+      })
     }),
-    close: () => rl.close(),
+    setPaletteColor: (color) => { paletteColor = color },
+    close: () => {
+      promptActive = false
+      clearPalette()
+      stdin.removeListener("keypress", onKeypress)
+      rl.close()
+    },
   }
 }
 
@@ -1431,11 +1515,12 @@ async function interactive(options, config, catalog, initialSession, store, root
   let session = initialSession
   let theme = await readTheme()
   let color = accent(theme)
+  questioner.setPaletteColor?.(color)
   let pendingImagePaths = [...(options.imagePaths ?? [])]
   const printSessionHeader = () => {
     const mode = session.mode === "plan" ? "Plan · только чтение" : "Build · изменения с подтверждением"
     writeChatMessage("DreyzeCode", `Проект: ${workspace}\nМодель: ${session.model}\nРежим: ${mode}`, color)
-    stdout.write("Сообщение отправляется по Enter · команды: / или /help · Tab показывает подсказки.\n")
+    stdout.write("Сообщение отправляется по Enter · подсказки команд появляются при вводе / · Tab дополняет.\n")
   }
   const printModels = () => {
     const rows = catalog.models.map((model) => `${model.id === session.model ? "●" : "○"} ${model.name} · ${model.id}${model.supportsImages ? " · images" : ""}`)
