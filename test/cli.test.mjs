@@ -239,8 +239,8 @@ test("lists only the validated Dreyze model catalog fields", async () => {
 
 test("doctor reports missing login as JSON without making a network request", async (t) => {
   const { config } = await fixture(t)
-  const cli = new URL("../cli.mjs", import.meta.url)
-  const child = spawnSync(process.execPath, [cli.pathname, "--json", "doctor"], {
+  const cli = fileURLToPath(new URL("../cli.mjs", import.meta.url))
+  const child = spawnSync(process.execPath, [cli, "--json", "doctor"], {
     env: { ...process.env, XDG_CONFIG_HOME: config },
     encoding: "utf8",
   })

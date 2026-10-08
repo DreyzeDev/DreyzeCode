@@ -558,6 +558,21 @@ async function callAgent(config, session, fetchImpl = fetch) {
   return body
 }
 
+function startWaitIndicator(step) {
+  if (!stderr.isTTY) return () => {}
+  let frame = 0
+  const render = () => {
+    stderr.write(`\rDreyzeCode · модель отвечает · шаг ${step + 1}${".".repeat((frame++ % 3) + 1)}   `)
+  }
+  render()
+  const timer = setInterval(render, 900)
+  timer.unref()
+  return () => {
+    clearInterval(timer)
+    stderr.write("\r\u001b[2K")
+  }
+}
+
 function actionJSON(action) {
   return JSON.stringify(action)
 }
@@ -565,7 +580,13 @@ function actionJSON(action) {
 export async function runAgentTask({ config, catalog, session, store, roots, workspace, question, yes = false, fetchImpl = fetch, onOutput = () => {} }) {
   await recoverPendingAction(session, store)
   for (let step = 0; step < MAX_STEPS; step++) {
-    const action = await callAgent(config, session, fetchImpl)
+    const stopWaiting = startWaitIndicator(step)
+    let action
+    try {
+      action = await callAgent(config, session, fetchImpl)
+    } finally {
+      stopWaiting()
+    }
     if (action.type === "blocked") throw Object.assign(new Error("Режим Plan запретил действие, меняющее проект."), { code: "PLAN_MODE_READ_ONLY" })
     if (action.type === "final") {
       appendMessage(session, "assistant", action.content)
