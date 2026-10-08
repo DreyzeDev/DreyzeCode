@@ -41,6 +41,51 @@ test("parses the product command surface with global flags before and after comm
   assert.deepEqual(parseArgs(["--image", "./first.png", "--image=./second.webp", "run", "Describe photos"]).imagePaths, ["./first.png", "./second.webp"])
 })
 
+test("runs authenticated web search as a read-only agent tool", async (t) => {
+  const { workspace, config } = await fixture(t)
+  const store = createSessionStore(workspace, config)
+  const session = await store.create("dreyze/research", "plan")
+  session.messages.push({ role: "user", content: "Find the current Node.js fetch documentation." })
+  const requests = []
+  const result = await runAgentTask({
+    config: { url: "https://moonfacet.example", cookie: "__Host-dreyzeai_session=abc" },
+    catalog: { models: [], defaultModel: "dreyze/research" },
+    session,
+    store,
+    roots: [workspace],
+    workspace,
+    question: async () => "",
+    onOutput: () => {},
+    fetchImpl: async (url, init) => {
+      const parsedUrl = new URL(url)
+      requests.push({ url: parsedUrl.pathname, init })
+      if (parsedUrl.pathname === "/api/code/agent/search") {
+        assert.equal(init.method, "POST")
+        assert.equal(init.headers.Cookie, "__Host-dreyzeai_session=abc")
+        assert.equal(init.redirect, "error")
+        assert.deepEqual(JSON.parse(init.body), { query: "Node.js fetch documentation" })
+        return Response.json({ query: "Node.js fetch documentation", sources: [{
+          title: "Node.js fetch",
+          url: "https://nodejs.org/api/globals.html#fetch",
+          snippet: "A browser-compatible implementation of the Fetch API.",
+        }] })
+      }
+      assert.equal(parsedUrl.pathname, "/api/code/agent/turn")
+      const requestBody = JSON.parse(init.body)
+      assert.equal(requestBody.mode, "plan")
+      if (requests.filter((request) => request.url === "/api/code/agent/turn").length === 1) {
+        return Response.json({ type: "tool", name: "web_search", input: { query: "Node.js fetch documentation" } })
+      }
+      assert.match(requestBody.messages.at(-1).content, /Node\.js fetch/u)
+      assert.match(requestBody.messages.at(-1).content, /nodejs\.org/u)
+      return Response.json({ type: "final", content: "The official documentation describes a browser-compatible Fetch API." })
+    },
+  })
+  assert.equal(requests.length, 3)
+  assert.equal(result.final, "The official documentation describes a browser-compatible Fetch API.")
+  assert.ok(session.messages.some((message) => message.content.startsWith("Tool result (web_search):")))
+})
+
 test("validates local image signatures and keeps image bytes out of saved session messages", async (t) => {
   const { workspace, config } = await fixture(t)
   const image = path.join(workspace, "photo.png")
@@ -494,7 +539,7 @@ test("runs the CLI when invoked through the symlink npm creates for its binary",
   await symlink(cli, command, "file")
   const child = spawnSync(command, ["--version"], { encoding: "utf8" })
   assert.equal(child.status, 0, child.stderr)
-  assert.equal(child.stdout, "DreyzeCode 0.4.1\n")
+  assert.equal(child.stdout, "DreyzeCode 0.4.2\n")
 })
 
 test("help documents image input in both one-shot and interactive modes", async () => {

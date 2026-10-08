@@ -85,8 +85,10 @@ read-only same-origin escape hatch restricted to `/api/` paths.
 - `skills list` for project-local capabilities
 - Interactive chat, `run`, `--continue`, `--session`, `--model`, and `--mode`
 - Local tools: list/read/search, image input, create/copy/move/write/edit/delete
-  files, create folders, run approved commands, ask the user, and start a
-  read-only research subagent in Build mode
+  files, create folders, run approved commands, search the web using the
+  account's monthly search allowance, ask the user, and start a read-only
+  research subagent in Build mode. Web search is read-only and available in
+  both Build and Plan modes.
 - `api get` for read-only diagnostics
 
 The CLI uses `/api/code/agent/turn` and `/api/code/v1/models` on the configured

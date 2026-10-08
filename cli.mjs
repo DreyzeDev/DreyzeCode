@@ -8,7 +8,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import { access, chmod, copyFile, lstat, mkdir, open, readdir, readFile, realpath, rename, stat, unlink, writeFile } from "node:fs/promises"
 import { fileURLToPath } from "node:url"
 
-export const VERSION = "0.4.1"
+export const VERSION = "0.4.2"
 const MAX_STEPS = 80
 const MAX_HISTORY = 40
 const MAX_MESSAGE_CHARS = 24_000
@@ -25,10 +25,10 @@ const MAX_PROJECT_SKILLS = 40
 const MAX_PROJECT_SKILL_CHARS = 12_000
 const IGNORED_SEARCH_DIRS = new Set([".git", ".next", ".turbo", ".venv", "venv", "build", "dist", "node_modules", "target", "vendor", "coverage"])
 const MUTATING_TOOLS = new Set(["create_directory", "copy_file", "move_file", "write_file", "edit_file", "delete_file", "run_command", "delegate_task"])
-const PLAN_TOOLS = new Set(["list_files", "read_file", "search_text", "ask_user"])
+const PLAN_TOOLS = new Set(["list_files", "read_file", "search_text", "web_search", "ask_user"])
 const TOOLS = new Set([
   "list_files", "read_file", "search_text", "create_directory", "copy_file", "move_file",
-  "write_file", "edit_file", "delete_file", "run_command", "ask_user", "delegate_task",
+  "write_file", "edit_file", "delete_file", "run_command", "ask_user", "delegate_task", "web_search",
 ])
 const DEFAULT_URL = "https://moonfacet.com"
 const packageDirectory = dirname(fileURLToPath(import.meta.url))
@@ -205,6 +205,37 @@ export async function fetchModelCatalog(config, fetchImpl = fetch) {
   }) : []
   if (!models.length) throw Object.assign(new Error("Каталог моделей Dreyze пуст."), { code: "EMPTY_MODEL_CATALOG" })
   return { models, defaultModel: typeof body.defaultModel === "string" ? body.defaultModel : models[0].id }
+}
+
+async function searchAgentWeb(config, query, fetchImpl = fetch) {
+  if (typeof query !== "string" || !query.trim() || query.length > 800) {
+    throw new Error("Запрос веб-поиска должен содержать не более 800 символов.")
+  }
+  const response = await fetchImpl(new URL("/api/code/agent/search", config.url), {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json", Cookie: config.cookie },
+    body: JSON.stringify({ query: query.trim() }),
+    redirect: "error",
+    cache: "no-store",
+    signal: AbortSignal.timeout(25_000),
+  })
+  const body = await response.json().catch(() => ({}))
+  if (!response.ok) {
+    throw Object.assign(new Error(safeError(body, `Веб-поиск завершился с ошибкой HTTP ${response.status}.`)), {
+      code: body?.error?.code || "WEB_SEARCH_FAILED",
+      status: response.status,
+    })
+  }
+  if (!Array.isArray(body.sources)) throw Object.assign(new Error("Сервис поиска вернул некорректный результат."), { code: "INVALID_WEB_SEARCH_RESPONSE" })
+  const sources = body.sources.slice(0, 5).flatMap((source) => {
+    if (!source || typeof source.title !== "string" || typeof source.url !== "string") return []
+    return [{
+      title: source.title.slice(0, 240),
+      url: source.url.slice(0, 500),
+      snippet: typeof source.snippet === "string" ? source.snippet.slice(0, 700) : "",
+    }]
+  })
+  return { output: JSON.stringify({ query: query.trim(), sources }) }
 }
 
 async function doctor(config, jsonMode) {
@@ -475,7 +506,7 @@ async function runShell(command, workspace) {
   })
 }
 
-export async function executeTool(action, { workspace, roots, approve, question, delegate }) {
+export async function executeTool(action, { workspace, roots, approve, question, delegate, webSearch }) {
   const input = action.input || {}
   const getPath = (name = "path", required = true) => {
     const value = input[name]
@@ -493,6 +524,12 @@ export async function executeTool(action, { workspace, roots, approve, question,
     if (task.length > 6_000) throw new Error("Задача подагента превышает 6000 символов.")
     if (typeof delegate !== "function") throw new Error("Исследовательский подагент недоступен в этом режиме.")
     return await delegate(task)
+  }
+  if (action.name === "web_search") {
+    const query = getPath("query")
+    if (query.length > 800) throw new Error("Запрос веб-поиска превышает 800 символов.")
+    if (typeof webSearch !== "function") throw new Error("Веб-поиск недоступен в этой сессии.")
+    return await webSearch(query)
   }
   if (action.name === "list_files") {
     const directory = await resolveWorkspacePath(getPath("path", false) || ".", roots, { mustExist: true, allowSensitive: true })
@@ -773,6 +810,7 @@ export async function runAgentTask({ config, catalog, session, store, roots, wor
           if (result.requiresInput) return { output: `Подагенту требуется уточнение, которое нужно задать пользователю: ${result.requiresInput}` }
           return { output: "Подагент завершил исследование без итогового ответа." }
         },
+        webSearch: (query) => searchAgentWeb(config, query, fetchImpl),
       })
     } catch (error) {
       result = { output: `Инструмент завершился ошибкой: ${error instanceof Error ? error.message : "неизвестная ошибка"}` }
