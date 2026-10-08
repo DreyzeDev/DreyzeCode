@@ -423,7 +423,15 @@ test("runs the CLI when invoked through the symlink npm creates for its binary",
   await symlink(cli, command, "file")
   const child = spawnSync(command, ["--version"], { encoding: "utf8" })
   assert.equal(child.status, 0, child.stderr)
-  assert.equal(child.stdout, "DreyzeCode 0.3.0\n")
+  assert.equal(child.stdout, "DreyzeCode 0.3.1\n")
+})
+
+test("help documents image input in both one-shot and interactive modes", async () => {
+  const cli = fileURLToPath(new URL("../cli.mjs", import.meta.url))
+  const child = spawnSync(process.execPath, [cli, "--help"], { encoding: "utf8" })
+  assert.equal(child.status, 0, child.stderr)
+  assert.match(child.stdout, /--image PATH/u)
+  assert.match(child.stdout, /\/attach PATH/u)
 })
 
 test("the raw API escape hatch rejects paths that normalize outside /api", async () => {

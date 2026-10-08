@@ -8,7 +8,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import { access, chmod, copyFile, lstat, mkdir, open, readdir, readFile, realpath, rename, stat, unlink, writeFile } from "node:fs/promises"
 import { fileURLToPath } from "node:url"
 
-export const VERSION = "0.3.0"
+export const VERSION = "0.3.1"
 const MAX_STEPS = 80
 const MAX_HISTORY = 40
 const MAX_MESSAGE_CHARS = 24_000
@@ -149,7 +149,7 @@ function printHelp() {
     `  dreyzecode api get /api/...            безопасный GET к API Dreyze\n\n` +
     `Параметры: --model ID, --mode build|plan, --add-dir PATH, --image PATH (повторяемый), --session ID, --json, --yes\n` +
     `В Build изменения файлов и команды требуют подтверждения. Plan разрешает только чтение.\n` +
-    `В интерактивном режиме: /mode build|plan, /model ID, /theme purple|blue|system, /exit.\n`)
+    `В интерактивном режиме: /mode build|plan, /model ID, /attach PATH, /theme purple|blue|system, /exit.\n`)
 }
 
 function jsonOut(value) {
@@ -267,7 +267,7 @@ export function createSessionStore(workspace, root = configRoot, { updateLatestP
       data.messages = data.messages
         .filter((message) => message && ["user", "assistant"].includes(message.role) && typeof message.content === "string")
         .map((message) => {
-          const imagePaths = Array.isArray(message.imagePaths)
+          const imagePaths = message.role === "user" && Array.isArray(message.imagePaths)
             ? message.imagePaths.filter((value) => typeof value === "string" && value.length <= 4_096).slice(0, MAX_IMAGES_PER_MESSAGE)
             : []
           return { role: message.role, content: message.content, ...(imagePaths.length ? { imagePaths } : {}) }
@@ -642,7 +642,7 @@ function truncateOutput(value) {
 
 async function agentMessages(session, roots, catalog) {
   const messages = session.messages.slice(-MAX_HISTORY)
-  const latestImageIndex = messages.findLastIndex((message) => Array.isArray(message.imagePaths) && message.imagePaths.length > 0)
+  const latestImageIndex = messages.findLastIndex((message) => message.role === "user" && Array.isArray(message.imagePaths) && message.imagePaths.length > 0)
   const imagePaths = latestImageIndex >= 0 ? messages[latestImageIndex].imagePaths : []
   if (imagePaths.length && imagePaths.length > MAX_IMAGES_PER_MESSAGE) throw new Error("В сохранённой сессии слишком много изображений.")
   const selectedModel = catalog.models.find((model) => model.id === session.model)
@@ -658,7 +658,7 @@ async function agentMessages(session, roots, catalog) {
     attachments.push(attachment)
   }
   return Promise.all(messages.map(async (message, index) => {
-    if (!Array.isArray(message.imagePaths) || !message.imagePaths.length) return { role: message.role, content: message.content }
+    if (message.role !== "user" || !Array.isArray(message.imagePaths) || !message.imagePaths.length) return { role: message.role, content: message.content }
     if (index !== latestImageIndex) {
       return { role: message.role, content: `${message.content}\n[Ранее приложенное изображение опущено из контекста. При необходимости попроси прикрепить его повторно.]` }
     }
