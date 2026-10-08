@@ -9,7 +9,7 @@ import { access, chmod, copyFile, lstat, mkdir, open, readdir, readFile, realpat
 import { fileURLToPath } from "node:url"
 import { connectMcpServers, listConfiguredMcpServers } from "./mcp-client.mjs"
 
-export const VERSION = "0.5.4"
+export const VERSION = "0.5.5"
 const MAX_STEPS = 80
 const MAX_HISTORY = 40
 const MAX_MESSAGE_CHARS = 24_000
@@ -547,8 +547,11 @@ async function assertParentAllowed(pathname, roots) {
 
 async function runShell(command, workspace) {
   if (typeof command !== "string" || !command.trim() || command.length > 4_000) throw new Error("Укажите команду длиной до 4000 символов.")
-  const shell = platform === "win32" ? (env.COMSPEC || "cmd.exe") : "/bin/sh"
-  const args = platform === "win32" ? ["/d", "/s", "/c", command] : ["-lc", command]
+  const shell = platform === "win32" ? "powershell.exe" : "/bin/sh"
+  const powershellCommand = `[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding; $OutputEncoding = [Console]::OutputEncoding; $ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'; ${command}; if ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE }`
+  const args = platform === "win32"
+    ? ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", powershellCommand]
+    : ["-lc", command]
   return await new Promise((resolvePromise, rejectPromise) => {
     const childEnv = { ...env }
     for (const key of Object.keys(childEnv)) if (/^(DREYZE|MOONFACET)_.*(COOKIE|TOKEN|SECRET|KEY)$/iu.test(key)) delete childEnv[key]
@@ -771,10 +774,11 @@ async function agentMessages(session, roots, catalog) {
 
 async function callAgent(config, session, fetchImpl = fetch, projectInstructions = [], projectSkills = [], roots = [], catalog = { models: [] }, mcpTools = []) {
   const messages = await agentMessages(session, roots, catalog)
+  const shell = platform === "win32" ? "powershell" : "posix"
   const response = await fetchImpl(new URL("/api/code/agent/turn", config.url), {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json", Cookie: config.cookie },
-    body: JSON.stringify({ model: session.model, mode: session.mode, messages, projectInstructions, projectSkills, mcpTools }),
+    body: JSON.stringify({ model: session.model, mode: session.mode, shell, messages, projectInstructions, projectSkills, mcpTools }),
     redirect: "error",
     signal: AbortSignal.timeout(160_000),
   })

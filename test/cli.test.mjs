@@ -103,6 +103,7 @@ test("runs authenticated web search as a read-only agent tool", async (t) => {
       assert.equal(parsedUrl.pathname, "/api/code/agent/turn")
       const requestBody = JSON.parse(init.body)
       assert.equal(requestBody.mode, "plan")
+      assert.equal(requestBody.shell, process.platform === "win32" ? "powershell" : "posix")
       if (requests.filter((request) => request.url === "/api/code/agent/turn").length === 1) {
         return Response.json({ type: "tool", name: "web_search", input: { query: "Node.js fetch documentation" } })
       }
@@ -407,6 +408,21 @@ test("rejects traversal, symlink escapes, and sensitive reads", async (t) => {
   await assert.rejects(resolveWorkspacePath("ordinary-name", [workspace]), /секретных файлов/u)
   assert.equal(isSensitivePath("/project/id_ed25519"), true)
   assert.equal(isSensitivePath("/project/src/tokenizer.ts"), false)
+})
+
+test("runs approved commands in the platform shell", async (t) => {
+  const { workspace } = await fixture(t)
+  const command = process.platform === "win32"
+    ? "Write-Output 'Dreyze shell execution verified'"
+    : "printf 'Dreyze shell execution verified\\n'"
+  const result = await executeTool({ name: "run_command", input: { command } }, {
+    workspace,
+    roots: [workspace],
+    approve: async () => true,
+    question: async () => null,
+  })
+  assert.match(result.output, /Код завершения: 0/u)
+  assert.match(result.output, /Dreyze shell execution verified/u)
 })
 
 test("denies a file write unless the user approves it", async (t) => {
@@ -779,7 +795,7 @@ test("runs the CLI when invoked through the symlink npm creates for its binary",
   await symlink(cli, command, "file")
   const child = spawnSync(command, ["--version"], { encoding: "utf8" })
   assert.equal(child.status, 0, child.stderr)
-  assert.equal(child.stdout, "DreyzeCode 0.5.4\n")
+  assert.equal(child.stdout, "DreyzeCode 0.5.5\n")
 })
 
 test("help documents image input in both one-shot and interactive modes", async () => {
