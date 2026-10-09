@@ -260,6 +260,64 @@ test("runs authenticated web search as a read-only agent tool", async (t) => {
   assert.ok(session.messages.some((message) => message.content.startsWith("Tool result (web_search):")))
 })
 
+test("cancels an in-flight model request and leaves the conversation resumable", async (t) => {
+  const { workspace, config } = await fixture(t)
+  const store = createSessionStore(workspace, config)
+  const session = await store.create("dreyze/test-model", "build")
+  session.messages.push({ role: "user", content: "Create a project and explain the result." })
+  await store.save(session)
+  const cancellation = new AbortController()
+  let requestSignal
+  await assert.rejects(runAgentTask({
+    config: { url: "https://moonfacet.example", cookie: "session" },
+    catalog: { models: [], defaultModel: "dreyze/test-model" },
+    session,
+    store,
+    roots: [workspace],
+    workspace,
+    question: async () => "",
+    signal: cancellation.signal,
+    fetchImpl: async (_url, init) => {
+      requestSignal = init.signal
+      cancellation.abort()
+      if (init.signal.aborted) throw init.signal.reason
+      await new Promise((_resolve, reject) => init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true }))
+    },
+  }), { code: "AGENT_CANCELLED" })
+  assert.equal(requestSignal?.aborted, true)
+  const saved = await store.load(session.id)
+  assert.equal(saved.messages.at(-1).content, "Create a project and explain the result.")
+  assert.equal(saved.pendingAction, null)
+})
+
+test("cancels a file change at its approval prompt before writing begins", async (t) => {
+  const { workspace, config } = await fixture(t)
+  const store = createSessionStore(workspace, config)
+  const session = await store.create("dreyze/test-model", "build")
+  session.messages.push({ role: "user", content: "Create a file." })
+  const cancellation = new AbortController()
+  await assert.rejects(runAgentTask({
+    config: { url: "https://moonfacet.example", cookie: "session" },
+    catalog: { models: [], defaultModel: "dreyze/test-model" },
+    session,
+    store,
+    roots: [workspace],
+    workspace,
+    signal: cancellation.signal,
+    question: async () => {
+      cancellation.abort()
+      return ""
+    },
+    fetchImpl: async () => Response.json({
+      type: "tool",
+      name: "write_file",
+      input: { path: "cancelled.txt", content: "must not be written" },
+    }),
+  }), { code: "AGENT_CANCELLED" })
+  await assert.rejects(readFile(path.join(workspace, "cancelled.txt"), "utf8"), { code: "ENOENT" })
+  assert.equal((await store.load(session.id)).pendingAction, null)
+})
+
 test("reports which local tool the agent is running and clears its activity state", async (t) => {
   const { workspace, config } = await fixture(t)
   await writeFile(path.join(workspace, "notes.txt"), "Saved project notes.")
@@ -635,6 +693,25 @@ test("runs approved commands in the platform shell", async (t) => {
   assert.match(result.output, /Dreyze shell execution verified/u)
 })
 
+test("stops a running shell command when the agent task is cancelled", async (t) => {
+  const { workspace } = await fixture(t)
+  const controller = new AbortController()
+  const command = process.platform === "win32" ? "Start-Sleep -Seconds 2" : "sleep 2"
+  const startedAt = Date.now()
+  const execution = executeTool({ name: "run_command", input: { command } }, {
+    workspace,
+    roots: [workspace],
+    approve: async () => true,
+    question: async () => null,
+    signal: controller.signal,
+  })
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, 100))
+  controller.abort()
+  const result = await execution
+  assert.ok(Date.now() - startedAt < 1_500, "the shell process should stop promptly")
+  assert.notEqual(result.code, 0)
+})
+
 test("denies a file write unless the user approves it", async (t) => {
   const { workspace } = await fixture(t)
   const destination = path.join(workspace, "new.txt")
@@ -963,6 +1040,31 @@ test("does not restart a recovered interactive session twice", async () => {
   assert.equal(runCount, 1)
 })
 
+test("saves a cancelled --continue task and reports how to resume it", async () => {
+  const session = { id: "session-1", pendingAction: null, messages: [{ role: "user", content: "Continue this work" }] }
+  let interruptHandler
+  let saveCount = 0
+  const output = []
+  const resumed = await resumeInteractiveSession({
+    options: { continuing: true, yes: false },
+    config: {}, catalog: {}, session,
+    store: { save: async () => { saveCount++ } },
+    roots: [], workspace: "/project", recovered: false,
+    questioner: { ask: async () => "", setInterruptHandler: (handler) => { interruptHandler = handler } },
+    runTask: async ({ signal }) => {
+      interruptHandler()
+      assert.equal(signal.aborted, true)
+      throw new Error("request aborted")
+    },
+    onOutput: (text) => output.push(text),
+  })
+  assert.equal(resumed, true)
+  assert.equal(saveCount, 1)
+  assert.match(output[0], /Задача остановлена/u)
+  assert.match(output[0], /--continue/u)
+  assert.equal(interruptHandler, null)
+})
+
 test("lists only the validated Dreyze model catalog fields", async () => {
   const catalog = await fetchModelCatalog({ url: "https://moonfacet.example", cookie: "private-cookie" }, async (url, init) => {
     assert.equal(new URL(url).pathname, "/api/code/v1/models")
@@ -1005,7 +1107,7 @@ test("runs the CLI when invoked through the symlink npm creates for its binary",
   await symlink(cli, command, "file")
   const child = spawnSync(command, ["--version"], { encoding: "utf8" })
   assert.equal(child.status, 0, child.stderr)
-  assert.equal(child.stdout, "DreyzeCode 0.5.14\n")
+  assert.equal(child.stdout, "DreyzeCode 0.5.15\n")
 })
 
 test("help documents image input in both one-shot and interactive modes", async () => {
@@ -1018,6 +1120,7 @@ test("help documents image input in both one-shot and interactive modes", async 
   assert.match(child.stdout, /\/skills/u)
   assert.match(child.stdout, /<имя-папки>/u)
   assert.match(child.stdout, /подсказки появляются при вводе/u)
+  assert.match(child.stdout, /Ctrl\+C останавливает текущую задачу/u)
   assert.match(child.stdout, /skills list/u)
 })
 

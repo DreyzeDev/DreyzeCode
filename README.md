@@ -68,6 +68,10 @@ the system clipboard, and `/rename NAME` gives the current conversation a
 recognizable title in the session list. Use `/history [number]` to view recent
 user and assistant messages in the current session; tool payloads stay hidden.
 Prefix a message with `//` when it should start with a literal `/`.
+Press Ctrl+C during a task to stop the current model request or running command;
+the session is saved so you can continue with `dreyzecode --continue`. If a
+write or command had already started, its outcome is marked unknown and the
+agent inspects the project before retrying it.
 
 The agent follows project guidance from `AGENTS.md` files and
 `.dreyze/instructions.md`. Nested `AGENTS.md` files are supplied with their

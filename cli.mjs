@@ -9,7 +9,7 @@ import { access, chmod, copyFile, lstat, mkdir, open, readdir, readFile, realpat
 import { fileURLToPath } from "node:url"
 import { connectMcpServers, listConfiguredMcpServers } from "./mcp-client.mjs"
 
-export const VERSION = "0.5.14"
+export const VERSION = "0.5.15"
 const MAX_STEPS = 80
 const MAX_HISTORY = 40
 const DEFAULT_HISTORY_DISPLAY_MESSAGES = 8
@@ -443,6 +443,7 @@ function printHelp() {
     `В Build изменения файлов и команды требуют подтверждения. Plan разрешает только чтение.\n` +
     `В интерактивном режиме: подсказки появляются при вводе /; Enter / открывает полный список.\n` +
     `Tab дополняет команды проекта, режимы, темы и модели.\n` +
+    `Ctrl+C останавливает текущую задачу, сохраняя сессию; /exit завершает чат.\n` +
     `Команды: /help, /skills, /mode, /model, /attach, /detach, /theme, /status, /history, /copy, /rename, /sessions, /resume, /new, /clear, /exit.\n` +
     `Проектный skill запускается как /<имя-папки> задача.\n`)
 }
@@ -820,7 +821,7 @@ async function assertParentAllowed(pathname, roots) {
   if (!within(allowedRoot, existing)) throw new Error("Путь через символьную ссылку выходит за разрешённую папку.")
 }
 
-async function runShell(command, workspace) {
+async function runShell(command, workspace, abortSignal) {
   if (typeof command !== "string" || !command.trim() || command.length > 4_000) throw new Error("Укажите команду длиной до 4000 символов.")
   const shell = platform === "win32" ? "powershell.exe" : "/bin/sh"
   const powershellCommand = `[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding; $OutputEncoding = [Console]::OutputEncoding; $ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'; ${command}; if ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE }`
@@ -830,7 +831,13 @@ async function runShell(command, workspace) {
   return await new Promise((resolvePromise, rejectPromise) => {
     const childEnv = { ...env }
     for (const key of Object.keys(childEnv)) if (/^(DREYZE|MOONFACET)_.*(COOKIE|TOKEN|SECRET|KEY)$/iu.test(key)) delete childEnv[key]
-    const child = spawn(shell, args, { cwd: workspace, env: childEnv, stdio: ["ignore", "pipe", "pipe"], windowsHide: true })
+    const child = spawn(shell, args, {
+      cwd: workspace,
+      env: childEnv,
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+      detached: platform !== "win32",
+    })
     let output = ""
     let timedOut = false
     const add = (chunk, label) => {
@@ -838,16 +845,39 @@ async function runShell(command, workspace) {
     }
     child.stdout.on("data", (chunk) => add(chunk, ""))
     child.stderr.on("data", (chunk) => add(chunk, "[stderr] "))
-    child.once("error", rejectPromise)
-    const timer = setTimeout(() => { timedOut = true; child.kill("SIGTERM") }, 120_000)
-    child.once("close", (code, signal) => {
+    const stopProcessTree = () => {
+      if (platform === "win32") {
+        child.kill()
+        return
+      }
+      if (!child.pid) {
+        child.kill("SIGTERM")
+        return
+      }
+      try { process.kill(-child.pid, "SIGTERM") } catch (error) {
+        if (error?.code !== "ESRCH") child.kill("SIGTERM")
+      }
+    }
+    const timer = setTimeout(() => { timedOut = true; stopProcessTree() }, 120_000)
+    const stopOnAbort = () => stopProcessTree()
+    const cleanup = () => {
       clearTimeout(timer)
+      abortSignal?.removeEventListener("abort", stopOnAbort)
+    }
+    child.once("error", (error) => {
+      cleanup()
+      rejectPromise(error)
+    })
+    if (abortSignal?.aborted) stopOnAbort()
+    else abortSignal?.addEventListener("abort", stopOnAbort, { once: true })
+    child.once("close", (code, signal) => {
+      cleanup()
       resolvePromise({ code: code ?? 1, signal, timedOut, output })
     })
   })
 }
 
-export async function executeTool(action, { workspace, roots, approve, question, delegate, webSearch }) {
+export async function executeTool(action, { workspace, roots, approve, question, delegate, webSearch, signal }) {
   const input = action.input || {}
   const getPath = (name = "path", required = true) => {
     const value = input[name]
@@ -941,7 +971,7 @@ export async function executeTool(action, { workspace, roots, approve, question,
   }
   if (action.name === "run_command") {
     if (!(await askApproval(action, { approve, question }))) return { output: "Действие отклонено пользователем." }
-    const result = await runShell(getPath("command"), workspace)
+    const result = await runShell(getPath("command"), workspace, signal)
     return { output: `Код завершения: ${result.code}${result.timedOut ? " (тайм-аут 120 секунд)" : ""}${result.signal ? `; сигнал ${result.signal}` : ""}\n${result.output || "(команда не вывела текст)"}` }
   }
   if (["copy_file", "move_file"].includes(action.name)) {
@@ -1047,20 +1077,59 @@ async function agentMessages(session, roots, catalog) {
   }))
 }
 
-async function callAgent(config, session, fetchImpl = fetch, projectInstructions = [], projectSkills = [], roots = [], catalog = { models: [] }, mcpTools = []) {
+function agentCancellationError(signal) {
+  return Object.assign(new Error("Задача остановлена пользователем."), {
+    code: "AGENT_CANCELLED",
+    ...(signal?.reason ? { cause: signal.reason } : {}),
+  })
+}
+
+function assertAgentNotCancelled(signal) {
+  if (signal?.aborted) throw agentCancellationError(signal)
+}
+
+function requestSignal(signal, timeoutMs) {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(new DOMException("Превышено время ожидания ответа модели.", "TimeoutError")), timeoutMs)
+  const forwardAbort = () => controller.abort(signal.reason ?? agentCancellationError(signal))
+  if (signal?.aborted) forwardAbort()
+  else signal?.addEventListener("abort", forwardAbort, { once: true })
+  return {
+    signal: controller.signal,
+    dispose() {
+      clearTimeout(timer)
+      signal?.removeEventListener("abort", forwardAbort)
+    },
+  }
+}
+
+async function callAgent(config, session, fetchImpl = fetch, projectInstructions = [], projectSkills = [], roots = [], catalog = { models: [] }, mcpTools = [], signal) {
   const messages = await agentMessages(session, roots, catalog)
   const shell = platform === "win32" ? "powershell" : "posix"
-  const response = await fetchImpl(new URL("/api/code/agent/turn", config.url), {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json", Cookie: config.cookie },
-    body: JSON.stringify({ model: session.model, mode: session.mode, shell, messages, projectInstructions, projectSkills, mcpTools }),
-    redirect: "error",
-    signal: AbortSignal.timeout(160_000),
-  })
-  const body = await response.json().catch(() => ({}))
-  if (!response.ok) throw Object.assign(new Error(safeError(body, `Агент Dreyze ответил с ошибкой HTTP ${response.status}.`)), { code: body?.error?.code || "AGENT_FAILED", status: response.status })
-  if (!body || !["plan", "tool", "final", "blocked"].includes(body.type)) throw Object.assign(new Error("Сервер вернул действие вне протокола агента."), { code: "INVALID_AGENT_ACTION" })
-  return body
+  const request = requestSignal(signal, 160_000)
+  try {
+    const response = await fetchImpl(new URL("/api/code/agent/turn", config.url), {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json", Cookie: config.cookie },
+      body: JSON.stringify({ model: session.model, mode: session.mode, shell, messages, projectInstructions, projectSkills, mcpTools }),
+      redirect: "error",
+      signal: request.signal,
+    })
+    let body
+    try { body = await response.json() } catch (error) {
+      if (request.signal.aborted) throw error
+      body = {}
+    }
+    assertAgentNotCancelled(signal)
+    if (!response.ok) throw Object.assign(new Error(safeError(body, `Агент Dreyze ответил с ошибкой HTTP ${response.status}.`)), { code: body?.error?.code || "AGENT_FAILED", status: response.status })
+    if (!body || !["plan", "tool", "final", "blocked"].includes(body.type)) throw Object.assign(new Error("Сервер вернул действие вне протокола агента."), { code: "INVALID_AGENT_ACTION" })
+    return body
+  } catch (error) {
+    if (signal?.aborted) throw agentCancellationError(signal)
+    throw error
+  } finally {
+    request.dispose()
+  }
 }
 
 function startWaitIndicator(step, activity = "ответ модели") {
@@ -1150,13 +1219,15 @@ async function approveMcpTool(action, mcp, { yes, question }) {
   return typeof answer === "string" && /^(y|yes|д|да)$/iu.test(answer.trim())
 }
 
-export async function runAgentTask({ config, catalog, session, store, roots, workspace, question, yes = false, fetchImpl = fetch, onOutput = () => {}, onActivity = () => () => {} }) {
+export async function runAgentTask({ config, catalog, session, store, roots, workspace, question, yes = false, fetchImpl = fetch, onOutput = () => {}, onActivity = () => () => {}, signal }) {
+  assertAgentNotCancelled(signal)
   await recoverPendingAction(session, store)
   const [projectInstructions, discoveredSkills] = await Promise.all([
     loadProjectInstructions(roots),
     loadProjectSkills(roots),
   ])
   const projectSkills = discoveredSkills.map(({ commandName, ...skill }) => skill)
+  assertAgentNotCancelled(signal)
   const mcp = session.mode === "build"
     ? await connectMcpServers({
       roots,
@@ -1169,10 +1240,11 @@ export async function runAgentTask({ config, catalog, session, store, roots, wor
   let repeatedActionCount = 0
   try {
     for (let step = 0; step < MAX_STEPS; step++) {
+    assertAgentNotCancelled(signal)
     const stopWaiting = startWaitIndicator(step, "модель отвечает")
     let action
     try {
-      action = await callAgent(config, session, fetchImpl, projectInstructions, projectSkills, roots, catalog, mcp.tools)
+      action = await callAgent(config, session, fetchImpl, projectInstructions, projectSkills, roots, catalog, mcp.tools, signal)
     } finally {
       stopWaiting()
     }
@@ -1219,6 +1291,7 @@ export async function runAgentTask({ config, catalog, session, store, roots, wor
       const approved = mcpAction
         ? await approveMcpTool(action, mcp, { yes, question })
         : await askApproval(action, { yes, question })
+      assertAgentNotCancelled(signal)
       if (!approved) {
         appendMessage(session, "user", `Tool result (${action.name}): действие отклонено пользователем.`)
         await store.save(session)
@@ -1227,17 +1300,19 @@ export async function runAgentTask({ config, catalog, session, store, roots, wor
       session.pendingAction = { id: randomUUID(), name: action.name, startedAt: new Date().toISOString() }
       await store.save(session)
     }
+    assertAgentNotCancelled(signal)
     let result
     const stopActivity = action.name === "ask_user"
       ? () => {}
       : onActivity(toolActivityLabel(action.name, mcpAction), step)
     try {
-      result = mcpAction ? await mcp.call(action.name, action.input) : await executeTool(action, {
+      result = mcpAction ? await mcp.call(action.name, action.input, { signal }) : await executeTool(action, {
         workspace,
         roots,
         approve: async () => true,
         question,
         yes: true,
+        signal,
         delegate: async (task) => {
           if (typeof store.fork !== "function") throw new Error("Не удалось создать отдельную сессию подагента.")
           const subagentStore = store.fork()
@@ -1252,6 +1327,7 @@ export async function runAgentTask({ config, catalog, session, store, roots, wor
             yes: false,
             fetchImpl,
             onOutput: () => {},
+            signal,
           })
           if (result.final) return { output: `Результат исследовательского подагента (только чтение):\n${result.final}` }
           if (result.requiresInput) return { output: `Подагенту требуется уточнение, которое нужно задать пользователю: ${result.requiresInput}` }
@@ -1260,10 +1336,12 @@ export async function runAgentTask({ config, catalog, session, store, roots, wor
         webSearch: (query) => searchAgentWeb(config, query, fetchImpl),
       })
     } catch (error) {
+      assertAgentNotCancelled(signal)
       result = { output: `Инструмент завершился ошибкой: ${error instanceof Error ? error.message : "неизвестная ошибка"}` }
     } finally {
       stopActivity?.()
     }
+    assertAgentNotCancelled(signal)
     session.pendingAction = null
     if (result?.requiresInput) {
       session.pendingQuestion = result.requiresInput
@@ -1427,6 +1505,9 @@ function promptInterface(jsonMode = false, catalog = { models: [] }) {
   let paletteAnchorRow = 0
   let paletteColor = (text) => text
   let paletteRenderTimer = null
+  let interruptHandler = null
+  let pendingAnswerResolver = null
+  let closed = false
 
   const moveToPalette = () => {
     const position = rl.getCursorPos()
@@ -1488,34 +1569,58 @@ function promptInterface(jsonMode = false, catalog = { models: [] }) {
     }, 20)
   }
   if (stdin.isTTY && output.isTTY) stdin.on("keypress", onKeypress)
+  rl.on("SIGINT", () => {
+    if (interruptHandler) {
+      interruptHandler()
+      if (promptActive) rl.write("\n")
+      else stderr.write("\n")
+      return
+    }
+    rl.close()
+  })
+  rl.once("close", () => {
+    closed = true
+    pendingAnswerResolver?.(null)
+  })
 
   return {
     ask: (prompt) => new Promise((resolvePromise) => {
-      if (!stdin.isTTY) return resolvePromise(null)
+      if (!stdin.isTTY || closed) return resolvePromise(null)
       promptActive = true
-      rl.question(prompt, (answer) => {
+      const finish = (answer) => {
+        if (pendingAnswerResolver !== finish) return
+        pendingAnswerResolver = null
         promptActive = false
         clearTimeout(paletteRenderTimer)
         clearPalette(true)
         resolvePromise(answer)
-      })
+      }
+      pendingAnswerResolver = finish
+      rl.question(prompt, finish)
     }),
     askChat: (color = (text) => text) => new Promise((resolvePromise) => {
-      if (!stdin.isTTY) return resolvePromise(null)
+      if (!stdin.isTTY || closed) return resolvePromise(null)
       const composer = formatChatComposer(Number(output.columns) || 76)
       promptActive = true
       output.write(`\n${color(composer.header)}\n${color(composer.hint)}\n`)
-      rl.question(composer.prompt, (answer) => {
+      const finish = (answer) => {
+        if (pendingAnswerResolver !== finish) return
+        pendingAnswerResolver = null
         promptActive = false
         clearTimeout(paletteRenderTimer)
         clearPalette(true)
         output.write(`${color(composer.footer)}\n`)
         resolvePromise(answer)
-      })
+      }
+      pendingAnswerResolver = finish
+      rl.question(composer.prompt, finish)
     }),
     setPaletteColor: (color) => { paletteColor = color },
+    setInterruptHandler: (handler) => { interruptHandler = typeof handler === "function" ? handler : null },
+    get closed() { return closed },
     close: () => {
       promptActive = false
+      interruptHandler = null
       clearTimeout(paletteRenderTimer)
       clearPalette()
       stdin.removeListener("keypress", onKeypress)
@@ -1644,16 +1749,32 @@ async function runPrompt(prompt, options, config, catalog, session, store, roots
   if (pendingQuestion) appendMessage(session, "user", `Ответ на уточнение «${pendingQuestion}»: ${prompt}`, imagePaths)
   else appendMessage(session, "user", prompt, imagePaths)
   await store.save(session)
-  const result = await runAgentTask({
-    config, catalog, session, store, roots, workspace, yes: options.yes,
-    question: questioner.ask,
-    onActivity: (activity, step) => startWaitIndicator(step, activity),
-    onOutput: (text) => {
-      if (options.json) return
-      if (typeof options.chatColor === "function") writeChatMessage(`DreyzeCode · ${session.model} · ${session.mode}`, text, options.chatColor)
-      else stdout.write(`${text}\n`)
-    },
-  })
+  const cancellation = new AbortController()
+  questioner.setInterruptHandler?.(() => cancellation.abort())
+  let result
+  try {
+    result = await runAgentTask({
+      config, catalog, session, store, roots, workspace, yes: options.yes,
+      question: questioner.ask,
+      onActivity: (activity, step) => startWaitIndicator(step, activity),
+      onOutput: (text) => {
+        if (options.json) return
+        if (typeof options.chatColor === "function") writeChatMessage(`DreyzeCode · ${session.model} · ${session.mode}`, text, options.chatColor)
+        else stdout.write(`${text}\n`)
+      },
+      signal: cancellation.signal,
+    })
+  } catch (error) {
+    if (!cancellation.signal.aborted) throw error
+    await store.save(session)
+    if (options.json || typeof options.chatColor !== "function") {
+      throw Object.assign(new Error("Задача остановлена. Сессия сохранена; продолжите через dreyzecode --continue."), { code: "AGENT_CANCELLED" })
+    }
+    writeChatMessage("Задача остановлена", "Сессия сохранена. Продолжите работу в этом чате или запустите dreyzecode --continue.", options.chatColor)
+    return { cancelled: true }
+  } finally {
+    questioner.setInterruptHandler?.(null)
+  }
   if (options.json) jsonOut({ ok: true, session: { id: session.id, model: session.model, mode: session.mode }, ...result })
   return result
 }
@@ -1672,32 +1793,45 @@ export async function resumeInteractiveSession({
   onOutput = (text) => stdout.write(`${text}\n`),
 }) {
   if (!options.continuing) return false
-  if (session.pendingQuestion) {
-    const pendingQuestion = session.pendingQuestion
-    const answer = await questioner.ask(`${pendingQuestion}: `)
-    if (answer === null) {
-      onOutput(pendingQuestion)
-      return false
+  const cancellation = new AbortController()
+  questioner.setInterruptHandler?.(() => cancellation.abort())
+  try {
+    if (session.pendingQuestion) {
+      const pendingQuestion = session.pendingQuestion
+      const answer = await questioner.ask(`${pendingQuestion}: `)
+      if (answer === null) {
+        onOutput(pendingQuestion)
+        return false
+      }
+      assertAgentNotCancelled(cancellation.signal)
+      session.pendingQuestion = null
+      appendMessage(session, "user", `Ответ на уточнение «${pendingQuestion}»: ${answer}`)
+      await store.save(session)
     }
-    session.pendingQuestion = null
-    appendMessage(session, "user", `Ответ на уточнение «${pendingQuestion}»: ${answer}`)
-    await store.save(session)
-  }
 
-  const last = session.messages.at(-1)
-  if (!recovered && last?.role !== "user") return false
-  await runTask({
-    config,
-    catalog,
-    session,
-    store,
-    roots,
-    workspace,
-    question: questioner.ask,
-    yes: options.yes,
-    onOutput,
-  })
-  return true
+    const last = session.messages.at(-1)
+    if (!recovered && last?.role !== "user") return false
+    await runTask({
+      config,
+      catalog,
+      session,
+      store,
+      roots,
+      workspace,
+      question: questioner.ask,
+      yes: options.yes,
+      onOutput,
+      signal: cancellation.signal,
+    })
+    return true
+  } catch (error) {
+    if (!cancellation.signal.aborted) throw error
+    await store.save(session)
+    onOutput("Задача остановлена. Сессия сохранена; продолжите через dreyzecode --continue.")
+    return true
+  } finally {
+    questioner.setInterruptHandler?.(null)
+  }
 }
 
 async function interactive(options, config, catalog, initialSession, store, roots, workspace, questioner) {
@@ -1746,7 +1880,7 @@ async function interactive(options, config, catalog, initialSession, store, root
   if (options.continuing && session.pendingQuestion && !resumed) return
   while (true) {
     const input = await questioner.askChat(color)
-    if (!input) { if (!stdin.isTTY) break; continue }
+    if (!input) { if (!stdin.isTTY || questioner.closed) break; continue }
     if (isSlashCommandPalette(input)) {
       printSlashHelp(color, catalog.skills)
       continue

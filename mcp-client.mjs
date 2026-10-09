@@ -210,15 +210,25 @@ async function loadServers(roots, userConfigPath) {
   return { servers, issues }
 }
 
-function withTimeout(promise, milliseconds, label) {
+function withTimeout(promise, milliseconds, label, signal) {
+  if (signal?.aborted) return Promise.reject(signal.reason ?? new DOMException("MCP call cancelled.", "AbortError"))
   let timer
-  return Promise.race([
+  let onAbort
+  const tasks = [
     promise,
     new Promise((_, reject) => {
       timer = setTimeout(() => reject(new Error(`${label}: истекло время ожидания.`)), milliseconds)
       timer.unref?.()
     }),
-  ]).finally(() => clearTimeout(timer))
+  ]
+  if (signal) tasks.push(new Promise((_, reject) => {
+    onAbort = () => reject(signal.reason ?? new DOMException("MCP call cancelled.", "AbortError"))
+    signal.addEventListener("abort", onAbort, { once: true })
+  }))
+  return Promise.race(tasks).finally(() => {
+    clearTimeout(timer)
+    signal?.removeEventListener("abort", onAbort)
+  })
 }
 
 function safeText(value, secretValues) {
@@ -337,14 +347,16 @@ export async function connectMcpServers({ roots, userConfigPath, approveServer, 
     redact(value) {
       return safeText(value, loaded.servers.flatMap((server) => server.secretValues))
     },
-    async call(name, args) {
+    async call(name, args, { signal } = {}) {
       const entry = entries.get(name)
       if (!entry) throw new Error("MCP инструмент больше не подключён.")
       if (!isRecord(args) || JSON.stringify(args).length > 100_000) throw new Error("Аргументы MCP инструмента некорректны или слишком велики.")
+      if (signal?.aborted) throw signal.reason ?? new DOMException("MCP call cancelled.", "AbortError")
       const result = await withTimeout(
         entry.client.callTool({ name: entry.toolName, arguments: args }),
         MCP_TOOL_TIMEOUT_MS,
         `Вызов MCP инструмента ${name}`,
+        signal,
       )
       return toolOutput(result, entry.secretValues)
     },
