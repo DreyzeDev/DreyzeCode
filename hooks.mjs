@@ -50,8 +50,12 @@ async function readHookFile(pathname, { scope, root }) {
   }
   let content
   try {
-    const canonical = normalizeRealPath(await realpath(pathname))
-    const safeRoot = root ? normalizeRealPath(root) : null
+    const [canonicalPath, canonicalRootPath] = await Promise.all([
+      realpath(pathname),
+      root ? realpath(root) : Promise.resolve(null),
+    ])
+    const canonical = normalizeRealPath(canonicalPath)
+    const safeRoot = canonicalRootPath ? normalizeRealPath(canonicalRootPath) : null
     if (safeRoot && !within(safeRoot, canonical)) return { hooks: [], issues: [`Файл hooks (${scope}) выходит за разрешённую папку.`] }
     content = await readFile(canonical, "utf8")
   } catch {
