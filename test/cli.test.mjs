@@ -9,6 +9,7 @@ import { EventEmitter } from "node:events"
 import { PassThrough } from "node:stream"
 import {
   clipboardTargets,
+  builtInSlashTask,
   copyToClipboard,
   createSessionStore,
   apiGet,
@@ -63,6 +64,18 @@ test("parses DreyzeCode slash commands with multiword arguments and literal slas
   assert.equal(parseSlashCommand("Build a storefront"), null)
 })
 
+test("keeps built-in slash tasks scoped to safe modes", () => {
+  const review = builtInSlashTask("review", "the login flow")
+  assert.equal(review.mode, "plan")
+  assert.match(review.prompt, /Область: the login flow/u)
+  assert.match(review.prompt, /не создавай, не редактируй и не удаляй файлы/u)
+  const init = builtInSlashTask("init")
+  assert.equal(init.mode, "build")
+  assert.match(init.prompt, /\.dreyze\/instructions\.md/u)
+  assert.match(init.prompt, /не перезаписывай/u)
+  assert.equal(builtInSlashTask("model"), null)
+})
+
 test("opens the slash command palette when the prompt contains only a slash", () => {
   assert.equal(isSlashCommandPalette("/"), true)
   assert.equal(isSlashCommandPalette("  /  "), true)
@@ -105,6 +118,8 @@ test("shows live slash suggestions for built-in commands and project skills", ()
   ])
   assert.deepEqual(slashCommandSuggestions("/his", catalog).map(({ usage }) => usage), ["/history [число]"])
   assert.deepEqual(slashCommandSuggestions("/cop", catalog).map(({ usage }) => usage), ["/copy"])
+  assert.deepEqual(slashCommandSuggestions("/rev", catalog).map(({ usage }) => usage), ["/review [область]"])
+  assert.deepEqual(slashCommandSuggestions("/ini", catalog).map(({ usage }) => usage), ["/init"])
   assert.deepEqual(slashCommandSuggestions("/ren", catalog).map(({ usage }) => usage), ["/rename <название>"])
   assert.deepEqual(slashCommandSuggestions("/help later", catalog), [])
   assert.deepEqual(slashCommandSuggestions("//tmp/project", catalog), [])
@@ -165,6 +180,10 @@ test("formats the interactive message composer within narrow and wide terminals"
     assert.equal(composer.prompt, "│ › ")
     assert.match(composer.hint, /Enter — отправить/u)
   }
+  const active = formatChatComposer(52, { model: "Dreyze Opus 5.5", mode: "plan", attachments: ["screenshot.png"] })
+  const activeText = active.hint.replace(/\n│ ?/gu, " ").replace(/ +│/gu, " ")
+  assert.match(activeText, /Dreyze Opus 5\.5 · Plan/u)
+  assert.match(activeText, /вложения:\s+screenshot\.png/u)
 })
 
 test("renders readable session history without internal tool payloads", () => {
@@ -1125,7 +1144,7 @@ test("runs the CLI when invoked through the symlink npm creates for its binary",
   await symlink(cli, command, "file")
   const child = spawnSync(command, ["--version"], { encoding: "utf8" })
   assert.equal(child.status, 0, child.stderr)
-  assert.equal(child.stdout, "DreyzeCode 0.5.16\n")
+  assert.equal(child.stdout, "DreyzeCode 0.5.17\n")
 })
 
 test("help documents image input in both one-shot and interactive modes", async () => {
@@ -1136,6 +1155,7 @@ test("help documents image input in both one-shot and interactive modes", async 
   assert.match(child.stdout, /\/help.*\/attach/u)
   assert.match(child.stdout, /\/copy.*\/rename/u)
   assert.match(child.stdout, /\/skills/u)
+  assert.match(child.stdout, /\/review.*\/init/u)
   assert.match(child.stdout, /<имя-папки>/u)
   assert.match(child.stdout, /подсказки появляются при вводе/u)
   assert.match(child.stdout, /Ctrl\+C останавливает текущую задачу/u)

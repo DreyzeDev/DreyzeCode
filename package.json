@@ -1,10 +1,11 @@
 {
   "name": "@dreyzeai/dreyzecode",
-  "version": "0.5.16",
+  "version": "0.5.17",
   "description": "Independent DreyzeCode terminal agent",
   "type": "module",
   "files": [
     "cli.mjs",
+    "hooks.mjs",
     "mcp-client.mjs",
     "auth-cli.mjs",
     "README.md",
@@ -26,7 +27,7 @@
   },
   "license": "UNLICENSED",
   "scripts": {
-    "check": "node --check cli.mjs && node --check auth-cli.mjs && node --check mcp-client.mjs",
+    "check": "node --check cli.mjs && node --check hooks.mjs && node --check auth-cli.mjs && node --check mcp-client.mjs",
     "test": "node --test"
   },
   "dependencies": {

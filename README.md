@@ -57,14 +57,18 @@ paths, not image bytes; images are checked against the allowed project folders
 each time they are sent. Each image is limited to 2.9 MB and a message to 7 MB
 total.
 
-Interactive mode has a framed message composer, separate panels for your
-messages and model replies, and a live status while the model or a local tool
-is working. Slash command suggestions appear as you type, including choices
-for modes, themes, and models. Enter `/` to open the full command palette or
-press Tab to complete a command. `/help` lists the built-in commands and
-project commands. Use `/skill-name task` to run a project command with a task,
-or `/skills` to list project commands. `/copy` puts the latest model reply on
-the system clipboard, and `/rename NAME` gives the current conversation a
+Interactive mode has a framed chat composer, separate panels for your messages
+and model replies, and a live status while the model or a local tool is
+working. The composer shows the selected model, mode, and queued image files.
+Slash command suggestions appear as you type, including choices for modes,
+themes, and models. Enter `/` to open the command palette or press Tab to
+complete a command. `/help` lists built-in DreyzeCode commands and project
+commands. `/review [scope]` inspects the project in read-only Plan mode and
+reports confirmed findings without changing files. `/init` asks the agent to
+create `.dreyze/instructions.md` with project guidance after normal write
+approval. Use `/skill-name task` to run a project command with a task, or
+`/skills` to list project commands. `/copy` puts the latest model reply on the
+system clipboard, and `/rename NAME` gives the current conversation a
 recognizable title in the session list. Use `/history [number]` to view recent
 user and assistant messages in the current session; tool payloads stay hidden.
 Prefix a message with `//` when it should start with a literal `/`.
@@ -88,6 +92,34 @@ skill command reads its instructions from the workspace and combines them with
 your task. `dreyzecode skills list` displays aliases without requiring login.
 Additional approved project folders can contain their own `.dreyze/skills`
 directory.
+
+Local lifecycle hooks can be listed with `/hooks` or `dreyzecode hooks list`.
+Project hooks live in `.dreyze/hooks.json`; user-wide hooks live in
+`hooks.json` beside the DreyzeCode user configuration. Hooks may run before or
+after a tool. Project hook commands require confirmation for each task before
+they run; `--yes` approves them along with other requested actions. A
+`beforeTool` hook can block an action by exiting with code 2. Plan mode does
+not run hooks. Hook commands run locally with Dreyze credential variables
+removed and have a bounded timeout.
+
+Example project configuration:
+
+```json
+{
+  "hooks": [
+    {
+      "event": "beforeTool",
+      "tools": ["run_command"],
+      "command": "npm test",
+      "timeoutMs": 30000
+    }
+  ]
+}
+```
+
+The hook receives a JSON event on stdin with the workspace and tool name,
+arguments, and (for `afterTool`) result. Successful output is passed back to
+the model as untrusted context; a failing hook is reported to the model.
 
 ## MCP servers
 
@@ -144,8 +176,8 @@ read-only same-origin escape hatch restricted to `/api/` paths.
 - `skills list` for project-local capabilities
 - `mcp list` for configured local and remote MCP servers
 - Interactive chat, `run`, `--continue`, `--session`, `--model`, and `--mode`
-- Slash commands for chat history, copying replies, naming and resuming sessions,
-  themes, models, and project-defined skills
+- Slash commands for review, project setup, hooks, chat history, copying
+  replies, naming and resuming sessions, themes, models, and project skills
 - Local tools: list/read/search, image input, create/copy/move/write/edit/delete
   files, create folders, run approved commands, search the web using the
   account's monthly search allowance, ask the user, and start a read-only
