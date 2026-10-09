@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url"
 import { connectMcpServers, listConfiguredMcpServers } from "./mcp-client.mjs"
 import { describeHooks, loadConfiguredHooks, runHookEvent } from "./hooks.mjs"
 
-export const VERSION = "0.5.21"
+export const VERSION = "0.5.22"
 const MAX_STEPS = 80
 const MAX_HISTORY = 40
 const DEFAULT_HISTORY_DISPLAY_MESSAGES = 8
@@ -158,7 +158,7 @@ export async function resolveWorkspacePath(rawPath, roots, { mustExist = false, 
 
 export function parseArgs(args) {
   const commands = new Set(["login", "logout", "doctor", "models", "sessions", "skills", "hooks", "mcp", "api", "run", "chat", "help"])
-  const result = { command: "interactive", positionals: [], addDirs: [], imagePaths: [], json: false, yes: false, continuing: false }
+  const result = { command: "interactive", positionals: [], addDirs: [], imagePaths: [], json: false, outputFormat: "text", yes: false, continuing: false }
   let index = 0
   if (args[0] === "--help" || args[0] === "-h" || args[0] === "help") return { ...result, command: "help" }
   if (args[0] === "--version" || args[0] === "-v") return { ...result, command: "version" }
@@ -172,8 +172,17 @@ export function parseArgs(args) {
     const arg = args[index]
     if (commands.has(arg) && result.command === "interactive" && result.positionals.length === 0) result.command = arg
     else if (arg === "--help" || arg === "-h") result.command = "help"
-    else if (arg === "--json") result.json = true
-    else if (arg === "--yes" || arg === "-y") result.yes = true
+    else if (arg === "--json") { result.json = true; result.outputFormat = "json" }
+    else if (arg === "--output-format") {
+      result.outputFormat = args[++index]
+      if (!result.outputFormat) throw new Error("--output-format требует значение: text, json или stream-json.")
+      if (!["text", "json", "stream-json"].includes(result.outputFormat)) throw new Error("--output-format принимает text, json или stream-json.")
+      result.json = result.outputFormat === "json"
+    } else if (arg.startsWith("--output-format=")) {
+      result.outputFormat = arg.slice("--output-format=".length)
+      if (!["text", "json", "stream-json"].includes(result.outputFormat)) throw new Error("--output-format принимает text, json или stream-json.")
+      result.json = result.outputFormat === "json"
+    } else if (arg === "--yes" || arg === "-y") result.yes = true
     else if (arg === "--continue" || arg === "-c") result.continuing = true
     else if (arg === "--model" || arg === "-m") {
       result.model = args[++index]
@@ -203,7 +212,8 @@ export function parseArgs(args) {
     else result.positionals.push(arg)
   }
   if (result.mode && result.mode !== "build" && result.mode !== "plan") throw new Error("--mode принимает build или plan.")
-  if (result.json && result.command === "interactive") throw new Error("В интерактивном режиме --json не поддерживается.")
+  if (result.outputFormat !== "text" && result.command === "interactive") throw new Error("JSON вывод доступен для одноразовой команды run, а не для интерактивного чата.")
+  if (result.outputFormat === "stream-json" && result.command !== "run") throw new Error("stream-json доступен только для одноразовой команды run.")
   return result
 }
 
@@ -493,7 +503,7 @@ function printHelp() {
     `  dreyzecode hooks list                  показать hooks проекта и пользователя\n` +
     `  dreyzecode mcp list                    показать настроенные MCP серверы\n` +
     `  dreyzecode api get /api/...            безопасный GET к API Dreyze\n\n` +
-    `Параметры: --model ID, --mode build|plan, --add-dir PATH, --image PATH (повторяемый), --session ID, --json, --yes\n` +
+    `Параметры: --model ID, --mode build|plan, --add-dir PATH, --image PATH (повторяемый), --session ID, --json, --output-format text|json|stream-json, --yes\n` +
     `В Build изменения файлов и команды требуют подтверждения. Plan разрешает только чтение.\n` +
     `В интерактивном режиме: подсказки появляются при вводе /; ↑↓ выбирают, Tab вставляет команду. Enter / открывает полный список.\n` +
     `Tab дополняет команды Dreyze, личные и проектные skills, режимы, темы и модели.\n` +
@@ -506,11 +516,28 @@ function jsonOut(value) {
   stdout.write(`${JSON.stringify(value)}\n`)
 }
 
-function reportError(error, jsonMode = false) {
+function createStreamJsonEmitter() {
+  const runId = randomUUID()
+  let sequence = 0
+  return (type, fields = {}) => jsonOut({ run_id: runId, sequence: ++sequence, ...fields, type })
+}
+
+function reportError(error, jsonMode = false, streamJson = false) {
   const message = error instanceof Error ? error.message : "Не удалось выполнить команду DreyzeCode."
-  if (jsonMode) jsonOut({ ok: false, error: { code: error?.code || "DREYZE_CODE_ERROR", message } })
+  if (streamJson) jsonOut({ type: "error", run_id: randomUUID(), sequence: 1, code: error?.code || "DREYZE_CODE_ERROR", message: redactSecrets(message) })
+  else if (jsonMode) jsonOut({ ok: false, error: { code: error?.code || "DREYZE_CODE_ERROR", message } })
   else stderr.write(`Ошибка: ${message}\n`)
   process.exitCode = 1
+}
+
+function requestedOutputFormat(args) {
+  let format = "text"
+  for (let index = 0; index < args.length; index++) {
+    if (args[index] === "--json") format = "json"
+    else if (args[index] === "--output-format") format = args[index + 1] || format
+    else if (args[index].startsWith("--output-format=")) format = args[index].slice("--output-format=".length)
+  }
+  return format
 }
 
 async function readConfig() {
@@ -1414,7 +1441,7 @@ async function approveMcpTool(action, mcp, { yes, question }) {
   return typeof answer === "string" && /^(y|yes|д|да)$/iu.test(answer.trim())
 }
 
-export async function runAgentTask({ config, catalog, session, store, roots, workspace, question, yes = false, fetchImpl = fetch, onOutput = () => {}, onActivity = () => () => {}, onToolOutput = () => {}, signal }) {
+export async function runAgentTask({ config, catalog, session, store, roots, workspace, question, yes = false, fetchImpl = fetch, onOutput = () => {}, onActivity = () => () => {}, onToolOutput = () => {}, onEvent = () => {}, signal }) {
   assertAgentNotCancelled(signal)
   await recoverPendingAction(session, store)
   const [projectInstructions, discoveredSkills] = await Promise.all([
@@ -1441,6 +1468,7 @@ export async function runAgentTask({ config, catalog, session, store, roots, wor
   try {
     for (let step = 0; step < MAX_STEPS; step++) {
     assertAgentNotCancelled(signal)
+    onEvent({ type: "status", subtype: "model_request_started", step: step + 1 })
     const stopWaiting = startWaitIndicator(step, "модель отвечает")
     let action
     try {
@@ -1448,10 +1476,12 @@ export async function runAgentTask({ config, catalog, session, store, roots, wor
     } finally {
       stopWaiting()
     }
+    onEvent({ type: "status", subtype: "model_response_received", step: step + 1, action: action.type })
     if (action.type === "blocked") throw Object.assign(new Error("Режим Plan запретил действие, меняющее проект."), { code: "PLAN_MODE_READ_ONLY" })
     if (action.type === "final") {
       appendMessage(session, "assistant", action.content)
       await store.save(session)
+      onEvent({ type: "assistant", subtype: "final", content: action.content, step: step + 1 })
       onOutput(action.content)
       return { final: action.content, steps: step + 1 }
     }
@@ -1460,6 +1490,7 @@ export async function runAgentTask({ config, catalog, session, store, roots, wor
       repeatedActionCount = 0
       appendMessage(session, "assistant", actionJSON(action))
       await store.save(session)
+      onEvent({ type: "assistant", subtype: "plan", content: action.content, step: step + 1 })
       onOutput(action.content)
       if (session.mode === "plan") return { final: action.content, steps: step + 1 }
       continue
@@ -1469,6 +1500,7 @@ export async function runAgentTask({ config, catalog, session, store, roots, wor
       throw Object.assign(new Error("Модель запросила неизвестный инструмент."), { code: "INVALID_TOOL_ACTION" })
     }
     if (session.mode === "plan" && !PLAN_TOOLS.has(action.name)) throw Object.assign(new Error("Plan разрешает только чтение файлов и поиск."), { code: "PLAN_MODE_READ_ONLY" })
+    onEvent({ type: "tool_use", name: action.name, step: step + 1 })
     const fingerprint = actionFingerprint(action)
     if (fingerprint === previousActionFingerprint) repeatedActionCount++
     else {
@@ -1488,15 +1520,18 @@ export async function runAgentTask({ config, catalog, session, store, roots, wor
       continue
     }
     if (MUTATING_TOOLS.has(action.name) || mcpAction) {
+      onEvent({ type: "permission", subtype: "requested", name: action.name, automatic: yes })
       const approved = mcpAction
         ? await approveMcpTool(action, mcp, { yes, question })
         : await askApproval(action, { yes, question })
       assertAgentNotCancelled(signal)
       if (!approved) {
+        onEvent({ type: "permission", subtype: "denied", name: action.name })
         appendMessage(session, "user", `Tool result (${action.name}): действие отклонено пользователем.`)
         await store.save(session)
         continue
       }
+      onEvent({ type: "permission", subtype: "granted", name: action.name })
     }
     const matchingBeforeHooks = hookConfig.hooks.filter((hook) => hook.event === "beforeTool" && (!hook.tools || hook.tools.includes(action.name)))
     const matchingAfterHooks = hookConfig.hooks.filter((hook) => hook.event === "afterTool" && (!hook.tools || hook.tools.includes(action.name)))
@@ -1590,6 +1625,13 @@ export async function runAgentTask({ config, catalog, session, store, roots, wor
       ...afterHooks.warnings.map((warning) => `Hook warning (данные): ${warning}`),
     ].join("\n\n")
     if (afterContext) result.output = `${result.output ?? ""}${result.output ? "\n\n" : ""}${afterContext}`.slice(0, MAX_TOOL_OUTPUT)
+    onEvent({
+      type: "tool_result",
+      name: action.name,
+      step: step + 1,
+      succeeded: !String(result?.output ?? "").startsWith("Инструмент завершился ошибкой:"),
+      requires_input: Boolean(result?.requiresInput),
+    })
     session.pendingAction = null
     if (result?.requiresInput) {
       session.pendingQuestion = result.requiresInput
@@ -2168,8 +2210,11 @@ async function runPrompt(prompt, options, config, catalog, session, store, roots
   if (pendingQuestion) appendMessage(session, "user", `Ответ на уточнение «${pendingQuestion}»: ${prompt}`, imagePaths)
   else appendMessage(session, "user", prompt, imagePaths)
   await store.save(session)
+  const streamJson = options.outputFormat === "stream-json"
+  const emit = streamJson ? createStreamJsonEmitter() : null
+  if (emit) emit("system", { subtype: "init", session_id: session.id, model: session.model, mode: session.mode, cwd: workspace })
   const cancellation = new AbortController()
-  const progress = createTerminalProgressCallbacks({ streamOutput: !options.json })
+  const progress = createTerminalProgressCallbacks({ streamOutput: !options.json && !streamJson })
   questioner.setInterruptHandler?.(() => cancellation.abort())
   let result
   try {
@@ -2178,14 +2223,20 @@ async function runPrompt(prompt, options, config, catalog, session, store, roots
       question: questioner.ask,
       onActivity: progress.onActivity,
       onToolOutput: progress.onToolOutput,
+      onEvent: emit ? (event) => emit(event.type, Object.fromEntries(Object.entries(event).filter(([key]) => key !== "type"))) : undefined,
       onOutput: (text) => {
-        if (options.json) return
+        if (options.json || streamJson) return
         if (typeof options.chatColor === "function") writeChatMessage(`DreyzeCode · ${session.model} · ${session.mode}`, text, options.chatColor)
         else stdout.write(`${text}\n`)
       },
       signal: cancellation.signal,
     })
   } catch (error) {
+    if (emit) {
+      emit("error", { code: error?.code || "DREYZE_CODE_ERROR", message: redactSecrets(error instanceof Error ? error.message : "Не удалось выполнить задачу.") })
+      process.exitCode = 1
+      return { failed: true }
+    }
     if (!cancellation.signal.aborted) throw error
     await store.save(session)
     if (options.json || typeof options.chatColor !== "function") {
@@ -2196,7 +2247,8 @@ async function runPrompt(prompt, options, config, catalog, session, store, roots
   } finally {
     questioner.setInterruptHandler?.(null)
   }
-  if (options.json) jsonOut({ ok: true, session: { id: session.id, model: session.model, mode: session.mode }, ...result })
+  if (emit) emit("result", { ok: true, session: { id: session.id, model: session.model, mode: session.mode }, ...result })
+  else if (options.json) jsonOut({ ok: true, session: { id: session.id, model: session.model, mode: session.mode }, ...result })
   return result
 }
 
@@ -2526,7 +2578,13 @@ async function launchAuth(args) {
 
 export async function runCli(args = process.argv.slice(2)) {
   let options
-  try { options = parseArgs(args) } catch (error) { reportError(error, args.includes("--json")); return }
+  try {
+    options = parseArgs(args)
+  } catch (error) {
+    const outputFormat = requestedOutputFormat(args)
+    reportError(error, outputFormat === "json", outputFormat === "stream-json")
+    return
+  }
   if (options.command === "help") return printHelp()
   if (options.command === "version") return stdout.write(`DreyzeCode ${VERSION}\n`)
   if (options.command === "login" || options.command === "logout") {
@@ -2620,7 +2678,7 @@ export async function runCli(args = process.argv.slice(2)) {
   }
   if (options.model) session.model = catalog.models.find((model) => model.id === options.model || model.name.toLowerCase() === options.model.toLowerCase()).id
   if (options.mode) session.mode = options.mode
-  const questioner = promptInterface(options.json, interactiveCatalog)
+  const questioner = promptInterface(options.json || options.outputFormat === "stream-json", interactiveCatalog)
   try {
     if (options.command === "run" || options.positionals.length > 0) {
       return await runPrompt(options.positionals.join(" "), options, config, interactiveCatalog, session, store, roots, workspace, questioner)
@@ -2635,5 +2693,8 @@ const invokedPath = process.argv[1]
   ? await realpath(process.argv[1]).catch(() => resolve(process.argv[1]))
   : null
 if (invokedPath && invokedPath === fileURLToPath(import.meta.url)) {
-  runCli().catch((error) => reportError(error, process.argv.includes("--json")))
+  runCli().catch((error) => {
+    const outputFormat = requestedOutputFormat(process.argv.slice(2))
+    reportError(error, outputFormat === "json", outputFormat === "stream-json")
+  })
 }

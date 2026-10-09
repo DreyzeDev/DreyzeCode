@@ -30,6 +30,7 @@ dreyzecode skills create personal my-review
 dreyzecode skills create project release-check
 dreyzecode mcp list
 dreyzecode run "Inspect the project and fix the failing check"
+dreyzecode run "Inspect the project" --output-format stream-json
 dreyzecode run "Describe the UI and suggest improvements" --image ./screenshot.png
 dreyzecode --continue
 dreyzecode --model dreyze/model-id --mode plan run "Review the authentication flow"
@@ -178,8 +179,14 @@ trimmed while keeping the original request and the most recent context.
 
 ## Machine-readable output
 
-`--json` prints one JSON object to stdout; progress and approvals use stderr.
-Successful commands return `{ "ok": true, ... }`. Errors return
+`--json` (or `--output-format json`) prints one JSON object to stdout; progress
+and approvals use stderr. `dreyzecode run "..." --output-format stream-json`
+prints a JSON object per line with a shared `run_id` and increasing `sequence`:
+initial session metadata, model turns, tool calls and results, permission
+decisions, and the final result. Assistant content appears after each complete
+server response; the current agent API does not stream model tokens. Errors
+also use a JSON line and return a nonzero exit code. Successful commands return
+`{ "ok": true, ... }`. Errors in single-object JSON mode return
 `{ "ok": false, "error": { "code": "...", "message": "..." } }` and use a
 nonzero exit code. Tokens and cookies are never printed. `api get` is a
 read-only same-origin escape hatch restricted to `/api/` paths.

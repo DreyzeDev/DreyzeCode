@@ -2,7 +2,8 @@ import assert from "node:assert/strict"
 import { access, mkdtemp, mkdir, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
-import { spawnSync } from "node:child_process"
+import { spawn, spawnSync } from "node:child_process"
+import { createServer } from "node:http"
 import test from "node:test"
 import { fileURLToPath } from "node:url"
 import { EventEmitter } from "node:events"
@@ -58,6 +59,11 @@ test("parses the product command surface with global flags before and after comm
   assert.equal(parseArgs(["skills", "list"]).command, "skills")
   assert.equal(parseArgs(["--continue"]).continuing, true)
   assert.deepEqual(parseArgs(["--image", "./first.png", "--image=./second.webp", "run", "Describe photos"]).imagePaths, ["./first.png", "./second.webp"])
+  assert.equal(parseArgs(["run", "Inspect the project", "--output-format", "stream-json"]).outputFormat, "stream-json")
+  assert.equal(parseArgs(["--output-format=stream-json", "run", "Inspect the project"]).outputFormat, "stream-json")
+  assert.equal(parseArgs(["run", "Inspect the project", "--output-format", "json"]).json, true)
+  assert.throws(() => parseArgs(["--output-format", "stream-json"]), /одноразовой команды run/u)
+  assert.throws(() => parseArgs(["models", "list", "--output-format", "stream-json"]), /только для одноразовой команды run/u)
 })
 
 test("parses DreyzeCode slash commands with multiword arguments and literal slash escape", () => {
@@ -248,6 +254,7 @@ test("runs authenticated web search as a read-only agent tool", async (t) => {
   const session = await store.create("dreyze/research", "plan")
   session.messages.push({ role: "user", content: "Find the current Node.js fetch documentation." })
   const requests = []
+  const events = []
   const result = await runAgentTask({
     config: { url: "https://moonfacet.example", cookie: "__Host-dreyzeai_session=abc" },
     catalog: { models: [], defaultModel: "dreyze/research" },
@@ -257,6 +264,7 @@ test("runs authenticated web search as a read-only agent tool", async (t) => {
     workspace,
     question: async () => "",
     onOutput: () => {},
+    onEvent: (event) => events.push(event),
     fetchImpl: async (url, init) => {
       const parsedUrl = new URL(url)
       requests.push({ url: parsedUrl.pathname, init })
@@ -286,6 +294,10 @@ test("runs authenticated web search as a read-only agent tool", async (t) => {
   assert.equal(requests.length, 3)
   assert.equal(result.final, "The official documentation describes a browser-compatible Fetch API.")
   assert.ok(session.messages.some((message) => message.content.startsWith("Tool result (web_search):")))
+  assert.deepEqual(events.filter((event) => event.type === "tool_use").map((event) => event.name), ["web_search"])
+  assert.deepEqual(events.filter((event) => event.type === "tool_result").map((event) => event.succeeded), [true])
+  assert.equal(events.at(-1).type, "assistant")
+  assert.equal(events.at(-1).subtype, "final")
 })
 
 test("cancels an in-flight model request and leaves the conversation resumable", async (t) => {
@@ -1411,6 +1423,59 @@ test("doctor reports missing login as JSON without making a network request", as
   assert.equal(child.stderr, "")
 })
 
+test("streams one-shot run events as ordered JSON lines", { timeout: 10_000 }, async (t) => {
+  const { config, workspace } = await fixture(t)
+  const cookie = `__Host-dreyzeai_session=${"a".repeat(64)}`
+  const requests = []
+  const server = createServer(async (request, response) => {
+    let body = ""
+    for await (const chunk of request) body += chunk
+    requests.push({ path: request.url, cookie: request.headers.cookie, body })
+    if (request.url === "/api/code/v1/models") {
+      response.writeHead(200, { "content-type": "application/json" })
+      response.end(JSON.stringify({ defaultModel: "dreyze/test", data: [{ id: "dreyze/test", name: "Test", group: "test" }] }))
+    } else if (request.url === "/api/code/agent/turn") {
+      response.writeHead(200, { "content-type": "application/json" })
+      response.end(JSON.stringify({ type: "final", content: "Задача завершена." }))
+    } else {
+      response.writeHead(404).end("{}")
+    }
+  })
+  await new Promise((resolvePromise) => server.listen(0, "127.0.0.1", resolvePromise))
+  t.after(() => new Promise((resolvePromise) => server.close(resolvePromise)))
+  const address = server.address()
+  const configData = JSON.stringify({ url: `http://127.0.0.1:${address.port}`, cookie })
+  for (const folder of [path.join(config, "dreyze-code"), path.join(config, "DreyzeCode")]) {
+    await mkdir(folder, { recursive: true })
+    await writeFile(path.join(folder, "config.json"), configData, { mode: 0o600 })
+  }
+  const cli = fileURLToPath(new URL("../cli.mjs", import.meta.url))
+  const child = spawn(process.execPath, [cli, "run", "Say hello", "--output-format", "stream-json"], {
+    cwd: workspace,
+    env: { ...process.env, XDG_CONFIG_HOME: config, APPDATA: config },
+    stdio: ["ignore", "pipe", "pipe"],
+  })
+  let stdoutText = ""
+  let stderrText = ""
+  child.stdout.setEncoding("utf8").on("data", (chunk) => { stdoutText += chunk })
+  child.stderr.setEncoding("utf8").on("data", (chunk) => { stderrText += chunk })
+  const exit = await new Promise((resolvePromise, rejectPromise) => {
+    child.once("error", rejectPromise)
+    child.once("close", (code, signal) => resolvePromise({ code, signal }))
+  })
+  assert.equal(exit.code, 0, stderrText)
+  assert.equal(stderrText, "")
+  assert.equal(requests.length, 2)
+  assert.ok(requests.every((request) => request.cookie === cookie))
+  const events = stdoutText.trim().split("\n").map((line) => JSON.parse(line))
+  assert.deepEqual(events.map((event) => event.type), ["system", "status", "status", "assistant", "result"])
+  assert.deepEqual(events.map((event) => event.sequence), [1, 2, 3, 4, 5])
+  assert.ok(events.every((event) => event.run_id === events[0].run_id))
+  assert.equal(events[0].session_id, events.at(-1).session.id)
+  assert.equal(events.find((event) => event.type === "assistant").content, "Задача завершена.")
+  assert.equal(events.at(-1).ok, true)
+})
+
 test("runs the CLI when invoked through the symlink npm creates for its binary", async (t) => {
   if (process.platform === "win32") {
     t.skip("Windows symlink creation depends on runner privileges")
@@ -1422,7 +1487,7 @@ test("runs the CLI when invoked through the symlink npm creates for its binary",
   await symlink(cli, command, "file")
   const child = spawnSync(command, ["--version"], { encoding: "utf8" })
   assert.equal(child.status, 0, child.stderr)
-  assert.equal(child.stdout, "DreyzeCode 0.5.21\n")
+  assert.equal(child.stdout, "DreyzeCode 0.5.22\n")
 })
 
 test("help documents image input in both one-shot and interactive modes", async () => {
