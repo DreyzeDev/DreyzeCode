@@ -1,6 +1,6 @@
 {
   "name": "@dreyzeai/dreyzecode",
-  "version": "0.5.23",
+  "version": "0.5.24",
   "description": "Independent DreyzeCode terminal agent",
   "type": "module",
   "files": [

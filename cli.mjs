@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url"
 import { connectMcpServers, listConfiguredMcpServers } from "./mcp-client.mjs"
 import { describeHooks, loadConfiguredHooks, runHookEvent } from "./hooks.mjs"
 
-export const VERSION = "0.5.23"
+export const VERSION = "0.5.24"
 const MAX_STEPS = 80
 const MAX_HISTORY = 40
 const DEFAULT_HISTORY_DISPLAY_MESSAGES = 8
@@ -50,6 +50,7 @@ export const SLASH_COMMANDS = Object.freeze([
   { name: "rename", usage: "/rename <название>", description: "дать имя текущей сессии" },
   { name: "sessions", usage: "/sessions", description: "показать последние сессии проекта" },
   { name: "resume", usage: "/resume [ID]", description: "открыть сессию по ID или последнюю" },
+  { name: "agents", usage: "/agents [list|start <задача>|show <ID>|stop <ID>|attach <ID>]", description: "запустить и управлять фоновыми исследовательскими агентами" },
   { name: "new", usage: "/new", description: "начать новую сессию" },
   { name: "clear", usage: "/clear", description: "очистить экран, сохранив историю" },
   { name: "exit", usage: "/exit", description: "завершить работу" },
@@ -157,7 +158,7 @@ export async function resolveWorkspacePath(rawPath, roots, { mustExist = false, 
 }
 
 export function parseArgs(args) {
-  const commands = new Set(["login", "logout", "doctor", "models", "sessions", "skills", "hooks", "mcp", "api", "run", "chat", "help"])
+  const commands = new Set(["login", "logout", "doctor", "models", "sessions", "agents", "skills", "hooks", "mcp", "api", "run", "chat", "help", "__agent-worker"])
   const result = { command: "interactive", positionals: [], addDirs: [], imagePaths: [], json: false, outputFormat: "text", readStdin: false, yes: false, continuing: false }
   let index = 0
   if (args[0] === "--help" || args[0] === "-h" || args[0] === "help") return { ...result, command: "help" }
@@ -327,6 +328,8 @@ export function completeSlashInput(line, catalog = { models: [] }) {
     ? ["build", "plan"]
     : name === "theme"
       ? ["purple", "blue", "system"]
+      : name === "agents"
+        ? ["list", "start", "show", "attach", "stop"]
       : name === "model" || name === "models"
         ? (Array.isArray(catalog?.models) ? catalog.models.map((model) => model.id).filter((id) => typeof id === "string") : [])
         : []
@@ -366,6 +369,14 @@ export function slashCommandSuggestions(line, catalog = { models: [], skills: []
             { value: "blue", description: "синяя тема" },
             { value: "system", description: "без цвета" },
           ]
+        : name === "agents"
+          ? [
+              { value: "list", description: "показать фоновые задачи" },
+              { value: "start", description: "запустить исследование только для чтения" },
+              { value: "show", description: "показать состояние и ответ агента" },
+              { value: "attach", description: "дождаться результата агента" },
+              { value: "stop", description: "остановить фоновую задачу" },
+            ]
         : name === "model" || name === "models"
           ? (Array.isArray(catalog?.models) ? catalog.models.flatMap((model) => typeof model?.id === "string"
               ? [{ value: model.id, description: model.name || model.id }]
@@ -514,6 +525,7 @@ function printHelp() {
     `  dreyzecode --json doctor               проверить настройку и API\n` +
     `  dreyzecode models list                 показать доступные модели\n` +
     `  dreyzecode sessions list               найти локальные сессии проекта\n` +
+    `  dreyzecode agents list|start|show|stop|attach  управлять фоновыми исследовательскими агентами\n` +
     `  dreyzecode sessions show <id>          вывести локальную сессию\n` +
     `  dreyzecode skills list                 показать личные и проектные skills\n` +
     `  dreyzecode skills create personal <имя> создать личную slash-команду\n` +
@@ -526,7 +538,7 @@ function printHelp() {
     `В интерактивном режиме: подсказки появляются при вводе /; ↑↓ выбирают, Tab вставляет команду. Enter / открывает полный список.\n` +
     `Tab дополняет команды Dreyze, личные и проектные skills, режимы, темы и модели.\n` +
     `Ctrl+C останавливает текущую задачу, сохраняя сессию; /exit завершает чат.\n` +
-    `Команды: /help, /skills, /hooks, /review, /init, /mode, /model, /attach, /detach, /theme, /status, /history, /copy, /rename, /sessions, /resume, /new, /clear, /exit.\n` +
+    `Команды: /help, /skills, /hooks, /review, /init, /mode, /model, /attach, /detach, /theme, /status, /history, /copy, /rename, /sessions, /resume, /agents, /new, /clear, /exit.\n` +
     `Личный или проектный skill запускается как /<имя-папки> задача.\n`)
 }
 
@@ -679,6 +691,7 @@ export function createSessionStore(workspace, root = configRoot, { updateLatestP
     if (typeof id !== "string" || !/^[0-9a-f-]{36}$/iu.test(id)) throw new Error("Некорректный ID сессии.")
     return join(directory, `${id}.json`)
   }
+  const cancelFileFor = (id) => `${fileFor(id)}.cancel`
   return {
     async create(model, mode) {
       const now = new Date().toISOString()
@@ -725,6 +738,27 @@ export function createSessionStore(workspace, root = configRoot, { updateLatestP
         await rename(latestTemp, join(directory, "latest"))
       }
     },
+    async requestCancel(id) {
+      await mkdir(directory, { recursive: true, mode: 0o700 })
+      const marker = cancelFileFor(id)
+      try {
+        await writeFile(marker, `${new Date().toISOString()}\n`, { mode: 0o600, flag: "wx" })
+      } catch (error) {
+        if (error?.code !== "EEXIST") throw error
+      }
+    },
+    async cancelRequested(id) {
+      try {
+        await access(cancelFileFor(id))
+        return true
+      } catch (error) {
+        if (error?.code === "ENOENT") return false
+        throw error
+      }
+    },
+    async clearCancel(id) {
+      try { await unlink(cancelFileFor(id)) } catch (error) { if (error?.code !== "ENOENT") throw error }
+    },
     fork({ updateLatestPointer: childUpdatesLatest = false } = {}) {
       return createSessionStore(workspace, root, { updateLatestPointer: childUpdatesLatest })
     },
@@ -741,12 +775,21 @@ export function createSessionStore(workspace, root = configRoot, { updateLatestP
             mode: parsed.mode,
             title: typeof parsed.title === "string" ? parsed.title : null,
             parentSessionId: typeof parsed.parentSessionId === "string" ? parsed.parentSessionId : null,
+            agentJob: parsed.agentJob && typeof parsed.agentJob === "object" ? {
+              status: typeof parsed.agentJob.status === "string" ? parsed.agentJob.status : "unknown",
+              task: typeof parsed.agentJob.task === "string" ? parsed.agentJob.task.slice(0, 240) : "",
+              createdAt: typeof parsed.agentJob.createdAt === "string" ? parsed.agentJob.createdAt : null,
+              startedAt: typeof parsed.agentJob.startedAt === "string" ? parsed.agentJob.startedAt : null,
+              finishedAt: typeof parsed.agentJob.finishedAt === "string" ? parsed.agentJob.finishedAt : null,
+              pid: Number.isSafeInteger(parsed.agentJob.pid) ? parsed.agentJob.pid : null,
+              error: typeof parsed.agentJob.error === "string" ? parsed.agentJob.error.slice(0, 800) : null,
+            } : null,
             updatedAt: parsed.updatedAt,
             messages: Array.isArray(parsed.messages) ? parsed.messages.length : 0,
           })
         } catch {}
       }
-      return values.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)))
+      return values.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt))).slice(0, Math.max(1, Math.min(limit, 100)))
     },
   }
 }
@@ -759,6 +802,132 @@ function appendMessage(session, role, content, imagePaths = []) {
   while (total > 130_000 && session.messages.length > 2) {
     const [removed] = session.messages.splice(1, 1)
     total -= removed.content.length
+  }
+}
+
+const TERMINAL_AGENT_JOB_STATES = new Set(["completed", "needs_input", "failed", "cancelled", "interrupted"])
+
+function processIsAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return error?.code === "EPERM"
+  }
+}
+
+export function backgroundAgentStatus(agent) {
+  const status = agent?.agentJob?.status
+  if ((status === "starting" || status === "running") && Number.isSafeInteger(agent.agentJob.pid) && !processIsAlive(agent.agentJob.pid)) return "interrupted"
+  if (status === "starting" && !agent.agentJob.pid && Date.now() - Date.parse(agent.agentJob.createdAt || 0) > 30_000) return "interrupted"
+  return status || "unknown"
+}
+
+function agentWorkerEnvironment() {
+  const childEnvironment = { ...env }
+  for (const key of Object.keys(childEnvironment)) {
+    if (/(?:COOKIE|TOKEN|SECRET|PASSWORD|API[_-]?KEY)/iu.test(key)) delete childEnvironment[key]
+  }
+  return childEnvironment
+}
+
+export async function startBackgroundAgentTask({ store, workspace, model, task, parentSessionId = null, spawnImpl = spawn, entrypoint = join(packageDirectory, "cli.mjs") }) {
+  if (typeof task !== "string" || !task.trim() || task.length > 6_000) throw new Error("Фоновая задача должна содержать от 1 до 6000 символов.")
+  if (!store || typeof store.fork !== "function") throw new Error("Не удалось открыть отдельное хранилище для фонового агента.")
+  const childStore = store.fork({ updateLatestPointer: false })
+  const session = await childStore.create(model, "plan")
+  session.parentSessionId = parentSessionId
+  session.title = task.trim().slice(0, 100)
+  session.agentJob = { status: "starting", task: task.trim(), createdAt: new Date().toISOString(), pid: null, error: null }
+  appendMessage(session, "user", `Исследуй проект в фоне по задаче:\n${task.trim()}\n\nРаботай только в режиме чтения. Не меняй файлы и не запускай команды. В конце верни конкретные выводы и пути к найденным файлам.`)
+  await childStore.clearCancel(session.id)
+  await childStore.save(session, { updateLatest: false })
+
+  let child
+  try {
+    child = spawnImpl(process.execPath, [entrypoint, "__agent-worker", session.id], {
+      cwd: workspace,
+      env: agentWorkerEnvironment(),
+      stdio: "ignore",
+      windowsHide: true,
+      detached: true,
+    })
+    await new Promise((resolvePromise, rejectPromise) => {
+      child.once("spawn", resolvePromise)
+      child.once("error", rejectPromise)
+    })
+    child.unref?.()
+    return session
+  } catch (error) {
+    session.agentJob.status = "failed"
+    session.agentJob.finishedAt = new Date().toISOString()
+    session.agentJob.error = redactSecrets(error instanceof Error ? error.message : "Не удалось запустить фоновый процесс.").slice(0, 800)
+    await childStore.save(session, { updateLatest: false })
+    throw error
+  }
+}
+
+export async function runBackgroundAgentWorker({ id, workspace, store, config, fetchImpl = fetch, runTask = runAgentTask, catalog: providedCatalog }) {
+  const session = await store.load(id)
+  if (!session.agentJob || session.mode !== "plan") throw new Error("Указанная сессия не является фоновым исследовательским агентом.")
+  if (TERMINAL_AGENT_JOB_STATES.has(session.agentJob.status)) return { status: session.agentJob.status }
+  const isolatedStore = typeof store.fork === "function" ? store.fork({ updateLatestPointer: false }) : store
+
+  const finish = async (status, error = null, details = {}) => {
+    session.agentJob = {
+      ...session.agentJob,
+      ...details,
+      status,
+      finishedAt: new Date().toISOString(),
+      error: error ? redactSecrets(error instanceof Error ? error.message : String(error)).slice(0, 800) : null,
+    }
+    await store.clearCancel(id)
+    await store.save(session, { updateLatest: false })
+    return { status, ...(error ? { error: session.agentJob.error } : {}) }
+  }
+
+  const cancellation = new AbortController()
+  let timer
+  try {
+    if (await store.cancelRequested(id)) return await finish("cancelled")
+    if (!config) throw Object.assign(new Error("Сессия DreyzeCode недоступна. Выполните dreyzecode login и запустите задачу снова."), { code: "AUTH_REQUIRED" })
+    const catalog = providedCatalog ?? await fetchModelCatalog(config, fetchImpl)
+    if (await store.cancelRequested(id)) return await finish("cancelled")
+    const roots = [await realpath(workspace)]
+    session.agentJob.status = "running"
+    session.agentJob.pid = process.pid
+    session.agentJob.startedAt = new Date().toISOString()
+    await store.save(session, { updateLatest: false })
+    timer = setInterval(() => {
+      void store.cancelRequested(id).then((requested) => {
+        if (requested && !cancellation.signal.aborted) cancellation.abort()
+      }).catch(() => {})
+    }, 300)
+    if (await store.cancelRequested(id)) cancellation.abort()
+    const result = await runTask({
+      config,
+      catalog,
+      session,
+      store: isolatedStore,
+      roots,
+      workspace: roots[0],
+      question: async () => null,
+      yes: false,
+      fetchImpl,
+      onOutput: () => {},
+      signal: cancellation.signal,
+    })
+    if (cancellation.signal.aborted) return await finish("cancelled")
+    if (result.requiresInput) {
+      session.pendingQuestion = result.requiresInput
+      return await finish("needs_input", null, { question: result.requiresInput })
+    }
+    return await finish("completed")
+  } catch (error) {
+    return await finish(cancellation.signal.aborted || error?.code === "AGENT_CANCELLED" ? "cancelled" : "failed", error)
+  } finally {
+    clearInterval(timer)
   }
 }
 
@@ -2184,6 +2353,156 @@ export async function apiGet(config, pathname, jsonMode) {
   if (!response.ok) process.exitCode = 1
 }
 
+function isAgentJobTerminal(status) {
+  return TERMINAL_AGENT_JOB_STATES.has(status)
+}
+
+export async function listBackgroundAgents({ workspace, parentSessionId = null, options = {} }) {
+  const store = createSessionStore(workspace)
+  const agents = (await store.list(100))
+    .filter((item) => item.agentJob && (!parentSessionId || item.parentSessionId === parentSessionId))
+    .map((item) => ({ ...item, agentJob: { ...item.agentJob, status: backgroundAgentStatus(item) } }))
+  if (options.json) jsonOut({ ok: true, agents })
+  else if (!options.quiet && !agents.length) stdout.write("Фоновых агентов нет. Запустите /agents start <задача> или dreyzecode agents start <задача>.\n")
+  else if (!options.quiet) for (const item of agents) {
+    const title = item.title || item.agentJob.task || "исследовательская задача"
+    stdout.write(`${item.agentJob.status}\t${item.id}\t${item.model}\t${title}\n`)
+  }
+  return agents
+}
+
+async function loadBackgroundAgent(store, id) {
+  if (!id) throw new Error("Укажите ID фонового агента.")
+  const session = await store.load(id)
+  if (!session.agentJob) throw new Error(`Сессия ${id} не является фоновой задачей.`)
+  return session
+}
+
+export async function showBackgroundAgent({ workspace, id, options = {} }) {
+  const session = await loadBackgroundAgent(createSessionStore(workspace), id)
+  const status = backgroundAgentStatus(session)
+  const output = {
+    id: session.id,
+    status,
+    model: session.model,
+    task: session.agentJob.task,
+    createdAt: session.agentJob.createdAt,
+    startedAt: session.agentJob.startedAt ?? null,
+    finishedAt: session.agentJob.finishedAt ?? null,
+    error: session.agentJob.error ?? null,
+    question: session.agentJob.question ?? session.pendingQuestion ?? null,
+    messages: visibleSessionMessages(session, MAX_HISTORY_DISPLAY_MESSAGES),
+  }
+  if (options.json) jsonOut({ ok: true, agent: output })
+  else if (!options.quiet) {
+    stdout.write(`${output.status}\t${output.id}\t${output.model}\n${output.task}\n`)
+    if (output.error) stdout.write(`Ошибка: ${output.error}\n`)
+    if (output.question) stdout.write(`Нужно уточнение: ${output.question}\n`)
+    for (const message of output.messages) stdout.write(`\n${message.role === "assistant" ? "АГЕНТ" : "ЗАДАЧА"}\n${message.content}\n`)
+  }
+  return output
+}
+
+export async function stopBackgroundAgent({ workspace, id, store = createSessionStore(workspace) }) {
+  const session = await loadBackgroundAgent(store, id)
+  const status = backgroundAgentStatus(session)
+  if (isAgentJobTerminal(status)) return { id, status, requested: false }
+  await store.requestCancel(id)
+  return { id, status: "stopping", requested: true }
+}
+
+export async function waitForBackgroundAgent({ store, id, intervalMs = 500, onStatus = () => {} }) {
+  let previousStatus = ""
+  while (true) {
+    const session = await loadBackgroundAgent(store, id)
+    const status = backgroundAgentStatus(session)
+    if (status !== previousStatus) {
+      onStatus(status, session)
+      previousStatus = status
+    }
+    if (isAgentJobTerminal(status)) return session
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, intervalMs))
+  }
+}
+
+export async function attachBackgroundAgent({ workspace, id, options = {} }) {
+  const store = createSessionStore(workspace)
+  const session = await waitForBackgroundAgent({
+    store,
+    id,
+    onStatus: (status) => { if (!options.json && !options.quiet) stderr.write(`Фоновый агент ${id}: ${status}\n`) },
+  })
+  return await showBackgroundAgent({ workspace, id, options })
+}
+
+function printAgentList(agents, color) {
+  const rows = agents.map((item) => `${item.agentJob.status} · ${item.id}\n  ${item.model} · ${item.title || item.agentJob.task}`)
+  writeChatMessage("Фоновые агенты", rows.join("\n\n") || "Фоновых агентов нет. Используйте /agents start <задача>.", color)
+}
+
+function printAgentDetails(agent, color) {
+  const rows = [`Статус: ${agent.status}`, `Модель: ${agent.model}`, `ID: ${agent.id}`, `Задача: ${agent.task}`]
+  if (agent.error) rows.push(`Ошибка: ${agent.error}`)
+  if (agent.question) rows.push(`Нужно уточнение: ${agent.question}`)
+  for (const message of agent.messages) rows.push(`${message.role === "assistant" ? "Агент" : message.role === "notice" ? "Состояние" : "Задача"}\n${message.content}`)
+  writeChatMessage("Фоновый агент", rows.join("\n\n"), color)
+}
+
+async function manageInteractiveAgents({ argument, session, store, workspace, color }) {
+  const value = argument.trim()
+  const actionMatch = /^(\S+)(?:\s+([\s\S]*))?$/u.exec(value)
+  const action = (actionMatch?.[1] || "list").toLowerCase()
+  const rest = actionMatch?.[2]?.trim() || ""
+  if (action === "list") {
+    const agents = await listBackgroundAgents({ workspace, options: { quiet: true } })
+    printAgentList(agents, color)
+    return
+  }
+  if (action === "start") {
+    if (!rest) {
+      writeChatMessage("Фоновый агент", "Использование: /agents start исследовать обработку изображений", color)
+      return
+    }
+    try {
+      const agent = await startBackgroundAgentTask({ store, workspace, model: session.model, task: rest, parentSessionId: session.id })
+      writeChatMessage("Исследование запущено", `Модель: ${session.model}\nID: ${agent.id}\nРежим: только чтение\nЗадача: ${rest}\nПосмотреть: /agents show ${agent.id}\nДождаться ответа: /agents attach ${agent.id}`, color)
+    } catch (error) {
+      writeChatMessage("Не удалось запустить агента", error instanceof Error ? error.message : "Не удалось запустить фоновую задачу.", color)
+    }
+    return
+  }
+  if (action === "show" || action === "attach") {
+    if (!rest) {
+      writeChatMessage("Фоновый агент", `Использование: /agents ${action} <ID>`, color)
+      return
+    }
+    try {
+      if (action === "attach") writeChatMessage("Ожидаю агента", rest, color)
+      const agent = action === "attach"
+        ? await attachBackgroundAgent({ workspace, id: rest, options: { quiet: true } })
+        : await showBackgroundAgent({ workspace, id: rest, options: { quiet: true } })
+      printAgentDetails(agent, color)
+    } catch (error) {
+      writeChatMessage("Фоновый агент", error instanceof Error ? error.message : "Не удалось загрузить задачу.", color)
+    }
+    return
+  }
+  if (action === "stop") {
+    if (!rest) {
+      writeChatMessage("Фоновый агент", "Использование: /agents stop <ID>", color)
+      return
+    }
+    try {
+      const result = await stopBackgroundAgent({ workspace, id: rest })
+      writeChatMessage(result.requested ? "Остановка запрошена" : "Агент уже завершён", `${result.id}\nСтатус: ${result.status}`, color)
+    } catch (error) {
+      writeChatMessage("Фоновый агент", error instanceof Error ? error.message : "Не удалось остановить задачу.", color)
+    }
+    return
+  }
+  writeChatMessage("Фоновый агент", "Команды: /agents list, /agents start <задача>, /agents show <ID>, /agents attach <ID>, /agents stop <ID>.", color)
+}
+
 async function listSessions(options, workspace) {
   const store = createSessionStore(workspace)
   const sessions = await store.list(100)
@@ -2426,6 +2745,10 @@ async function interactive(options, config, catalog, initialSession, store, root
         for (const issue of issues) writeChatMessage("Hook configuration", redactSecrets(issue), color)
         continue
       }
+      if (name === "agents") {
+        await manageInteractiveAgents({ argument, session, store, workspace, color })
+        continue
+      }
       if (name === "mode") {
         if (!value) writeChatMessage("Режим", `Сейчас: ${session.mode}. Используйте /mode build или /mode plan.`, color)
         else if (!["build", "plan"].includes(value.toLowerCase())) writeChatMessage("Режим", "Выберите build или plan.", color)
@@ -2613,6 +2936,30 @@ export async function runCli(args = process.argv.slice(2)) {
   const config = await readConfig()
   if (options.command === "doctor") return doctor(config, options.json)
   const workspace = await realpath(process.cwd())
+  if (options.command === "__agent-worker") {
+    const id = options.positionals[0]
+    if (options.positionals.length !== 1) throw new Error("Внутренняя команда агента требует один ID сессии.")
+    const result = await runBackgroundAgentWorker({ id, workspace, store: createSessionStore(workspace), config })
+    if (result.status === "failed") process.exitCode = 1
+    return
+  }
+  if (options.command === "agents" && options.positionals[0] !== "start") {
+    const [action = "list", id] = options.positionals
+    if (action === "list" && options.positionals.length <= 1) return listBackgroundAgents({ workspace, options })
+    if (action === "show" && id && options.positionals.length === 2) return showBackgroundAgent({ workspace, id, options })
+    if (action === "stop" && id && options.positionals.length === 2) {
+      const result = await stopBackgroundAgent({ workspace, id })
+      if (options.json) jsonOut({ ok: true, ...result })
+      else stdout.write(`${result.status}\t${result.id}${result.requested ? "\nОстановка запрошена." : ""}\n`)
+      return
+    }
+    if (action === "attach" && id && options.positionals.length === 2) return attachBackgroundAgent({ workspace, id, options })
+    throw new Error("Использование: dreyzecode agents list|start <задача>|show <ID>|stop <ID>|attach <ID>")
+  }
+  if (options.command === "agents" && options.positionals[0] === "start") {
+    if (options.positionals.length < 2) throw new Error("Использование: dreyzecode agents start <задача> [--model ID]")
+    if (options.mode && options.mode !== "plan") throw new Error("Фоновые агенты всегда работают в режиме Plan и только читают файлы.")
+  }
   if (options.command === "sessions") {
     const subcommand = options.positionals[0]
     if (subcommand === "list") return listSessions(options, workspace)
@@ -2685,6 +3032,20 @@ export async function runCli(args = process.argv.slice(2)) {
     if (options.positionals[0] && options.positionals[0] !== "list") throw new Error("Использование: dreyzecode models list")
     if (options.json) jsonOut({ ok: true, defaultModel: catalog.defaultModel, models: catalog.models })
     else printHumanModels(catalog)
+    return
+  }
+  if (options.command === "agents") {
+    if (options.positionals[0] !== "start" || options.positionals.length < 2) throw new Error("Использование: dreyzecode agents start <задача> [--model ID]")
+    if (options.mode && options.mode !== "plan") throw new Error("Фоновые агенты всегда работают в режиме Plan и только читают файлы.")
+    const model = options.model || catalog.defaultModel
+    if (!catalog.models.some((item) => item.id === model || item.name.toLowerCase() === model.toLowerCase())) {
+      throw new Error(`Модель «${model}» отсутствует в каталоге Dreyze.`)
+    }
+    const selectedModel = catalog.models.find((item) => item.id === model || item.name.toLowerCase() === model.toLowerCase())
+    const task = options.positionals.slice(1).join(" ")
+    const agent = await startBackgroundAgentTask({ store: createSessionStore(workspace), workspace, model: selectedModel.id, task })
+    if (options.json) jsonOut({ ok: true, agent: { id: agent.id, status: agent.agentJob.status, model: agent.model, task: agent.agentJob.task } })
+    else stdout.write(`Исследовательский агент запущен · ${agent.id}\nМодель: ${agent.model}\nЗадача: ${agent.agentJob.task}\nПосмотреть: dreyzecode agents show ${agent.id}\nДождаться результата: dreyzecode agents attach ${agent.id}\n`)
     return
   }
   const roots = await canonicalRoots(workspace, options.addDirs)

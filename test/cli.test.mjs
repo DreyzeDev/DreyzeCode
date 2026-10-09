@@ -16,6 +16,7 @@ import {
   createLiveToolOutputStream,
   apiGet,
   buildSkillPrompt,
+  backgroundAgentStatus,
   completeSlashInput,
   createSkillScaffold,
   executeTool,
@@ -36,6 +37,8 @@ import {
   resumeInteractiveSession,
   resolveWorkspacePath,
   runAgentTask,
+  runBackgroundAgentWorker,
+  stopBackgroundAgent,
   slashTabCompletion,
   slashCommandSuggestions,
   visibleSessionMessages,
@@ -57,6 +60,7 @@ test("parses the product command surface with global flags before and after comm
   assert.deepEqual(parseArgs(["--json", "doctor"]).command, "doctor")
   assert.deepEqual(parseArgs(["--model", "dreyze/model", "--mode", "plan", "run", "Review", "this"]).positionals, ["Review", "this"])
   assert.equal(parseArgs(["sessions", "list"]).command, "sessions")
+  assert.equal(parseArgs(["agents", "start", "Inspect the workspace"]).command, "agents")
   assert.equal(parseArgs(["skills", "list"]).command, "skills")
   assert.equal(parseArgs(["--continue"]).continuing, true)
   assert.deepEqual(parseArgs(["--image", "./first.png", "--image=./second.webp", "run", "Describe photos"]).imagePaths, ["./first.png", "./second.webp"])
@@ -165,7 +169,105 @@ test("shows live choices for slash command arguments", () => {
   assert.deepEqual(slashCommandSuggestions("/mode p", catalog).map(({ usage }) => usage), ["/mode plan"])
   assert.deepEqual(slashCommandSuggestions("/theme ", catalog).map(({ usage }) => usage), ["/theme purple", "/theme blue", "/theme system"])
   assert.deepEqual(slashCommandSuggestions("/model dreyze/o", catalog).map(({ usage }) => usage), ["/model dreyze/opus"])
+  assert.deepEqual(slashCommandSuggestions("/agents star", catalog).map(({ usage }) => usage), ["/agents start"])
   assert.deepEqual(slashCommandSuggestions("/help later", catalog), [])
+})
+
+test("runs a background research task in its own read-only session without changing the active session", { timeout: 15_000 }, async (t) => {
+  const { config, workspace } = await fixture(t)
+  const cookie = `__Host-dreyzeai_session=${"b".repeat(64)}`
+  const requests = []
+  const server = createServer(async (request, response) => {
+    let body = ""
+    for await (const chunk of request) body += chunk
+    requests.push({ path: request.url, cookie: request.headers.cookie, body })
+    if (request.url === "/api/code/v1/models") {
+      response.writeHead(200, { "content-type": "application/json" })
+      response.end(JSON.stringify({ defaultModel: "dreyze/test", data: [{ id: "dreyze/test", name: "Test", group: "test" }] }))
+    } else if (request.url === "/api/code/agent/turn") {
+      response.writeHead(200, { "content-type": "application/json" })
+      response.end(JSON.stringify({ type: "final", content: "Фоновое исследование завершено." }))
+    } else response.writeHead(404).end("{}")
+  })
+  await new Promise((resolvePromise) => server.listen(0, "127.0.0.1", resolvePromise))
+  t.after(() => new Promise((resolvePromise) => server.close(resolvePromise)))
+  const address = server.address()
+  const configData = JSON.stringify({ url: `http://127.0.0.1:${address.port}`, cookie })
+  for (const folder of [path.join(config, "dreyze-code"), path.join(config, "DreyzeCode")]) {
+    await mkdir(folder, { recursive: true })
+    await writeFile(path.join(folder, "config.json"), configData, { mode: 0o600 })
+  }
+
+  const sessionRoot = process.platform === "win32" ? path.join(config, "DreyzeCode") : path.join(config, "dreyze-code")
+  const store = createSessionStore(workspace, sessionRoot)
+  const active = await store.create("dreyze/test", "build")
+  await store.save(active)
+  const cli = fileURLToPath(new URL("../cli.mjs", import.meta.url))
+  const environment = { ...process.env, XDG_CONFIG_HOME: config, APPDATA: config }
+  const invoke = (args) => new Promise((resolvePromise, rejectPromise) => {
+    const child = spawn(process.execPath, [cli, ...args], { cwd: workspace, env: environment, stdio: ["ignore", "pipe", "pipe"] })
+    let stdoutText = ""
+    let stderrText = ""
+    child.stdout.setEncoding("utf8").on("data", (chunk) => { stdoutText += chunk })
+    child.stderr.setEncoding("utf8").on("data", (chunk) => { stderrText += chunk })
+    child.once("error", rejectPromise)
+    child.once("close", (code) => resolvePromise({ code, stdout: stdoutText, stderr: stderrText }))
+  })
+
+  const started = await invoke(["agents", "start", "Inspect the project safely", "--json"])
+  assert.equal(started.code, 0, started.stderr)
+  const startResult = JSON.parse(started.stdout)
+  assert.equal(startResult.ok, true)
+  const id = startResult.agent.id
+  const attached = await invoke(["agents", "attach", id, "--json"])
+  assert.equal(attached.code, 0, attached.stderr)
+  const result = JSON.parse(attached.stdout)
+  assert.equal(result.ok, true)
+  assert.equal(result.agent.status, "completed")
+  assert.ok(result.agent.messages.some((message) => message.content === "Фоновое исследование завершено."))
+  const agentRequest = requests.find((request) => request.path === "/api/code/agent/turn")
+  assert.ok(agentRequest)
+  assert.equal(agentRequest.cookie, cookie)
+  const requestBody = JSON.parse(agentRequest.body)
+  assert.equal(requestBody.mode, "plan")
+  assert.equal(requestBody.model, "dreyze/test")
+  assert.match(requestBody.messages.at(-1).content, /Inspect the project safely/u)
+  assert.equal((await store.latest()).id, active.id)
+})
+
+test("cancels a background agent and keeps its state out of the latest-session pointer", { timeout: 5_000 }, async (t) => {
+  const { config, workspace } = await fixture(t)
+  const store = createSessionStore(workspace, config)
+  const active = await store.create("dreyze/test", "build")
+  await store.save(active)
+  const childStore = store.fork({ updateLatestPointer: false })
+  const agent = await childStore.create("dreyze/test", "plan")
+  agent.agentJob = { status: "starting", task: "wait until stopped", createdAt: new Date().toISOString(), pid: null }
+  await childStore.save(agent, { updateLatest: false })
+  assert.equal(backgroundAgentStatus({ ...agent, agentJob: { ...agent.agentJob, status: "running", pid: 2_147_483_647 } }), "interrupted")
+
+  let markRunning
+  const running = new Promise((resolvePromise) => { markRunning = resolvePromise })
+  const work = runBackgroundAgentWorker({
+    id: agent.id,
+    workspace,
+    store,
+    config: { url: "https://moonfacet.example", cookie: "session" },
+    catalog: { models: [], defaultModel: "dreyze/test" },
+    runTask: ({ signal }) => new Promise((resolvePromise, rejectPromise) => {
+      markRunning()
+      const cancel = () => rejectPromise(Object.assign(new Error("stopped"), { code: "AGENT_CANCELLED" }))
+      if (signal.aborted) cancel()
+      else signal.addEventListener("abort", cancel, { once: true })
+    }),
+  })
+  await running
+  const stopping = await stopBackgroundAgent({ workspace, id: agent.id, store })
+  assert.equal(stopping.requested, true)
+  assert.equal((await stopBackgroundAgent({ workspace, id: agent.id, store })).requested, true)
+  assert.equal((await work).status, "cancelled")
+  assert.equal((await store.load(agent.id)).agentJob.status, "cancelled")
+  assert.equal((await store.latest()).id, active.id)
 })
 
 test("provides safe platform clipboard commands and copies UTF-8 chat replies", async () => {
@@ -1510,7 +1612,7 @@ test("runs the CLI when invoked through the symlink npm creates for its binary",
   await symlink(cli, command, "file")
   const child = spawnSync(command, ["--version"], { encoding: "utf8" })
   assert.equal(child.status, 0, child.stderr)
-  assert.equal(child.stdout, "DreyzeCode 0.5.23\n")
+  assert.equal(child.stdout, "DreyzeCode 0.5.24\n")
 })
 
 test("help documents image input in both one-shot and interactive modes", async () => {

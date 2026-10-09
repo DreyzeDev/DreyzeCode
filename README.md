@@ -38,6 +38,9 @@ dreyzecode --model dreyze/model-id --mode plan run "Review the authentication fl
 dreyzecode --add-dir ../shared-library run "Compare the shared library API"
 dreyzecode api get /api/code/v1/models
 dreyzecode sessions list
+dreyzecode agents start "Review the image upload flow"
+dreyzecode agents list
+dreyzecode agents attach <agent-id>
 ```
 
 Build mode can read and search project files. It asks before changing files,
@@ -82,6 +85,15 @@ Press Ctrl+C during a task to stop the current model request or running command;
 the session is saved so you can continue with `dreyzecode --continue`. If a
 write or command had already started, its outcome is marked unknown and the
 agent inspects the project before retrying it.
+
+Background research agents run in a separate saved session and leave the
+current chat and its resume pointer unchanged. Start one with
+`dreyzecode agents start "task"` or `/agents start task`; check it with
+`agents list` or `/agents show ID`, wait for the result with `agents attach ID`,
+and request cancellation with `agents stop ID`. These background tasks always
+use read-only Plan mode: they can inspect project files and search the web, but
+cannot write files, run commands, or invoke MCP tools. The original chat remains
+available while research runs.
 
 The agent follows project guidance from `AGENTS.md` files and
 `.dreyze/instructions.md`. Nested `AGENTS.md` files are supplied with their
@@ -200,6 +212,7 @@ characters. Use `--yes` when running unattended tasks that need approval.
 ## Current command contract
 
 - `login`, `logout`, `doctor`, `models list`, `sessions list`, `sessions show`
+- `agents list|start|show|attach|stop` and the matching `/agents` chat command
 - `skills list` for personal and project-local capabilities
 - `mcp list` for configured local and remote MCP servers
 - Interactive chat, `run`, `--continue`, `--session`, `--model`, and `--mode`
