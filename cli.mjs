@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url"
 import { connectMcpServers, listConfiguredMcpServers } from "./mcp-client.mjs"
 import { describeHooks, loadConfiguredHooks, runHookEvent } from "./hooks.mjs"
 
-export const VERSION = "0.5.25"
+export const VERSION = "0.5.26"
 const MAX_STEPS = 80
 const MAX_HISTORY = 40
 const DEFAULT_HISTORY_DISPLAY_MESSAGES = 8
@@ -976,10 +976,10 @@ export async function runBackgroundAgentWorker({ id, workspace, store, config, f
             await new Promise((resolvePromise) => setTimeout(resolvePromise, 250))
           }
         } finally {
-          await store.clearAgentResponse(id, requestId)
           delete session.agentJob.approval
           if (session.agentJob.status === "awaiting_approval") session.agentJob.status = "running"
           await isolatedStore.save(session, { updateLatest: false })
+          await store.clearAgentResponse(id, requestId)
         }
       },
       yes: false,
@@ -2525,7 +2525,14 @@ export async function waitForBackgroundAgent({ store, id, intervalMs = 500, onSt
       onStatus(status, session)
       previousStatus = status
     }
-    if (isAgentJobTerminal(status) || status === "awaiting_approval") return session
+    if (isAgentJobTerminal(status)) return session
+    if (status === "awaiting_approval") {
+      const requestId = session.agentJob?.approval?.id
+      const response = requestId && typeof store.readAgentResponse === "function"
+        ? await store.readAgentResponse(id, requestId)
+        : null
+      if (response === null) return session
+    }
     await new Promise((resolvePromise) => setTimeout(resolvePromise, intervalMs))
   }
 }

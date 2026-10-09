@@ -301,6 +301,7 @@ test("background Build agents wait for a direct approval before modifying the pr
   }
   assert.equal(pending.status, "awaiting_approval", pending.error || "Agent did not request approval.")
   assert.match(pending.approval.prompt, /denied\.txt/u)
+  const firstApprovalId = pending.approval.id
   const denial = await invoke(["agents", "deny", id, "--json"])
   assert.equal(denial.code, 0, denial.stderr)
   assert.equal(JSON.parse(denial.stdout).decision, "denied")
@@ -309,7 +310,7 @@ test("background Build agents wait for a direct approval before modifying the pr
     const shown = await invoke(["agents", "show", id, "--json"])
     assert.equal(shown.code, 0, shown.stderr)
     pending = JSON.parse(shown.stdout).agent
-    if (pending.status === "awaiting_approval") break
+    if (pending.status === "awaiting_approval" && pending.approval?.id !== firstApprovalId) break
     if (["failed", "interrupted", "completed"].includes(pending.status)) break
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 100))
   }
@@ -1784,7 +1785,7 @@ test("runs the CLI when invoked through the symlink npm creates for its binary",
   await symlink(cli, command, "file")
   const child = spawnSync(command, ["--version"], { encoding: "utf8" })
   assert.equal(child.status, 0, child.stderr)
-  assert.equal(child.stdout, "DreyzeCode 0.5.25\n")
+  assert.equal(child.stdout, "DreyzeCode 0.5.26\n")
 })
 
 test("help documents image input in both one-shot and interactive modes", async () => {
