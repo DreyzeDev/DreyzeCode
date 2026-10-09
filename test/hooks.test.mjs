@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises"
+import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import test from "node:test"
@@ -8,10 +8,11 @@ import { loadConfiguredHooks, runHookEvent } from "../hooks.mjs"
 async function fixture(t) {
   const root = await mkdtemp(path.join(os.tmpdir(), "dreyze-hooks-"))
   t.after(() => rm(root, { recursive: true, force: true }))
-  const workspace = path.join(root, "project")
+  const workspacePath = path.join(root, "project")
   const user = path.join(root, "user")
-  await mkdir(path.join(workspace, ".dreyze"), { recursive: true })
+  await mkdir(path.join(workspacePath, ".dreyze"), { recursive: true })
   await mkdir(user, { recursive: true })
+  const workspace = await realpath(workspacePath)
   return { root, workspace, user, userConfigPath: path.join(user, "hooks.json") }
 }
 
