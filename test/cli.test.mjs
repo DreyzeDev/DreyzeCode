@@ -13,6 +13,9 @@ import {
   builtInSlashTask,
   copyToClipboard,
   createSessionStore,
+  beginTurnCheckpoint,
+  recordCheckpointChange,
+  rewindSession,
   createLiveToolOutputStream,
   apiGet,
   buildSkillPrompt,
@@ -1404,6 +1407,71 @@ test("renames a project folder and refuses to move a folder into itself", async 
   }), /внутрь самой себя/u)
 })
 
+test("rewinds direct file changes and removes the selected turn from the conversation", async (t) => {
+  const { workspace, config } = await fixture(t)
+  const store = createSessionStore(workspace, config)
+  const session = await store.create("dreyze/test-model", "build")
+  const checkpoint = await beginTurnCheckpoint(session, store, "Update the file")
+  session.messages.push({ role: "user", content: "Update the file", checkpointId: checkpoint.id })
+  await store.save(session)
+  const target = path.join(workspace, "existing.txt")
+  await writeFile(target, "before")
+  const onCheckpoint = (change) => recordCheckpointChange(session, store, checkpoint.id, change)
+  await executeTool({ name: "write_file", input: { path: "existing.txt", content: "after" } }, {
+    workspace, roots: [workspace], question: async () => "yes", onCheckpoint,
+  })
+  assert.equal(await readFile(target, "utf8"), "after")
+  const resumed = await store.load(session.id)
+  const result = await rewindSession(resumed, store, { roots: [workspace] })
+  assert.equal(await readFile(target, "utf8"), "before")
+  assert.equal(result.reverted, 1)
+  assert.equal(resumed.messages.length, 0)
+  assert.equal(resumed.checkpoints[0].status, "rewound")
+})
+
+test("rewinds created folders, files, and moved files in reverse order", async (t) => {
+  const { workspace, config } = await fixture(t)
+  const store = createSessionStore(workspace, config)
+  const session = await store.create("dreyze/test-model", "build")
+  const checkpoint = await beginTurnCheckpoint(session, store, "Create and move files")
+  session.messages.push({ role: "user", content: "Create and move files", checkpointId: checkpoint.id })
+  await store.save(session)
+  await writeFile(path.join(workspace, "source.txt"), "move me")
+  const onCheckpoint = (change) => recordCheckpointChange(session, store, checkpoint.id, change)
+  await executeTool({ name: "create_directory", input: { path: "new/nested" } }, {
+    workspace, roots: [workspace], question: async () => "yes", onCheckpoint,
+  })
+  await executeTool({ name: "write_file", input: { path: "new/nested/created.txt", content: "created" } }, {
+    workspace, roots: [workspace], question: async () => "yes", onCheckpoint,
+  })
+  await executeTool({ name: "move_file", input: { source: "source.txt", destination: "new/nested/moved.txt" } }, {
+    workspace, roots: [workspace], question: async () => "yes", onCheckpoint,
+  })
+  const result = await rewindSession(session, store, { roots: [workspace] })
+  assert.equal(result.reverted, 4)
+  assert.equal(await readFile(path.join(workspace, "source.txt"), "utf8"), "move me")
+  await assert.rejects(readFile(path.join(workspace, "new", "nested", "created.txt"), "utf8"), { code: "ENOENT" })
+  await assert.rejects(stat(path.join(workspace, "new")), { code: "ENOENT" })
+})
+
+test("refuses to rewind a file that changed after the agent turn", async (t) => {
+  const { workspace, config } = await fixture(t)
+  const store = createSessionStore(workspace, config)
+  const session = await store.create("dreyze/test-model", "build")
+  const checkpoint = await beginTurnCheckpoint(session, store, "Create a file")
+  session.messages.push({ role: "user", content: "Create a file", checkpointId: checkpoint.id })
+  await store.save(session)
+  const target = path.join(workspace, "created.txt")
+  const onCheckpoint = (change) => recordCheckpointChange(session, store, checkpoint.id, change)
+  await executeTool({ name: "write_file", input: { path: "created.txt", content: "agent version" } }, {
+    workspace, roots: [workspace], question: async () => "yes", onCheckpoint,
+  })
+  await writeFile(target, "user version")
+  await assert.rejects(rewindSession(session, store, { roots: [workspace] }), /изменён после хода/u)
+  assert.equal(await readFile(target, "utf8"), "user version")
+  assert.equal(session.messages.length, 1)
+})
+
 test("redacts credentials embedded in JSON output, common tokens, and authenticated URLs", () => {
   const raw = JSON.stringify({
     GITHUB_TOKEN: "ghp_123456789012345678901234567890",
@@ -1654,7 +1722,7 @@ test("resumes an interactive clarification once and prints its final response on
   })
   assert.equal(resumed, true)
   assert.equal(runCount, 1)
-  assert.equal(saveCount, 1)
+  assert.equal(saveCount, 3)
   assert.deepEqual(output, ["Created Storefront."])
 })
 
@@ -1694,7 +1762,7 @@ test("saves a cancelled --continue task and reports how to resume it", async () 
     onOutput: (text) => output.push(text),
   })
   assert.equal(resumed, true)
-  assert.equal(saveCount, 1)
+  assert.equal(saveCount, 4)
   assert.match(output[0], /Задача остановлена/u)
   assert.match(output[0], /--continue/u)
   assert.equal(interruptHandler, null)
@@ -1797,7 +1865,7 @@ test("runs the CLI when invoked through the symlink npm creates for its binary",
   await symlink(cli, command, "file")
   const child = spawnSync(command, ["--version"], { encoding: "utf8" })
   assert.equal(child.status, 0, child.stderr)
-  assert.equal(child.stdout, "DreyzeCode 0.5.26\n")
+  assert.equal(child.stdout, "DreyzeCode 0.5.27\n")
 })
 
 test("help documents image input in both one-shot and interactive modes", async () => {

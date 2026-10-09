@@ -82,6 +82,13 @@ task, or `/skills` to list available commands. `/copy` puts the latest model rep
 system clipboard, and `/rename NAME` gives the current conversation a
 recognizable title in the session list. Use `/history [number]` to view recent
 user and assistant messages in the current session; tool payloads stay hidden.
+Use `/rewind` to inspect recent turns, then `/rewind 1` to restore the latest
+turn's direct file edits and remove its messages from the session after an
+explicit confirmation. DreyzeCode verifies file contents before restoring so
+later edits are preserved. It tracks direct file and folder tools only; shell
+commands, MCP tools, hooks, desktop folders, and oversized snapshots may not be
+reversible. Checkpoints are local to the saved session and are not a substitute
+for Git.
 Prefix a message with `//` when it should start with a literal `/`.
 Press Ctrl+C during a task to stop the current model request or running command;
 the session is saved so you can continue with `dreyzecode --continue`. If a
@@ -220,7 +227,7 @@ characters. Use `--yes` when running unattended tasks that need approval.
 - `mcp list` for configured local and remote MCP servers
 - Interactive chat, `run`, `--continue`, `--session`, `--model`, and `--mode`
 - Slash commands for review, project setup, hooks, chat history, copying
-  replies, naming and resuming sessions, themes, models, and personal or
+  replies, safe turn rewind, naming and resuming sessions, themes, models, and personal or
   project skills
 - Local tools: list/read/search, image input, create/copy/move/write/edit/delete
   files, create folders, run approved commands, search the web using the

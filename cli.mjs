@@ -6,14 +6,19 @@ import { StringDecoder } from "node:string_decoder"
 import { homedir } from "node:os"
 import { env, platform, stdin, stdout, stderr } from "node:process"
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
-import { access, chmod, copyFile, lstat, mkdir, open, readdir, readFile, realpath, rename, stat, unlink, writeFile } from "node:fs/promises"
+import { access, chmod, copyFile, lstat, mkdir, open, readFile, readlink, readdir, realpath, rename, rmdir, stat, unlink, writeFile } from "node:fs/promises"
 import { fileURLToPath } from "node:url"
 import { connectMcpServers, listConfiguredMcpServers } from "./mcp-client.mjs"
 import { describeHooks, loadConfiguredHooks, runHookEvent } from "./hooks.mjs"
 
-export const VERSION = "0.5.26"
+export const VERSION = "0.5.27"
 const MAX_STEPS = 80
 const MAX_HISTORY = 40
+const MAX_CHECKPOINTS = 100
+const MAX_CHECKPOINT_CHANGES = MAX_STEPS * 2
+const MAX_CHECKPOINT_BLOB_BYTES = 20_000_000
+const MAX_CHECKPOINT_SESSION_BLOB_BYTES = 100_000_000
+const MAX_CHECKPOINT_TREE_ENTRIES = 5_000
 const DEFAULT_HISTORY_DISPLAY_MESSAGES = 8
 const MAX_HISTORY_DISPLAY_MESSAGES = 30
 const MAX_HISTORY_DISPLAY_CHARS = 2_500
@@ -46,6 +51,7 @@ export const SLASH_COMMANDS = Object.freeze([
   { name: "theme", usage: "/theme purple|blue|system", description: "изменить оформление терминала" },
   { name: "status", usage: "/status", description: "показать текущую сессию и проект" },
   { name: "history", usage: "/history [число]", description: "показать последние сообщения чата" },
+  { name: "rewind", usage: "/rewind [номер]", description: "откатить изменения и историю выбранного хода" },
   { name: "copy", usage: "/copy", description: "скопировать последний ответ модели" },
   { name: "rename", usage: "/rename <название>", description: "дать имя текущей сессии" },
   { name: "sessions", usage: "/sessions", description: "показать последние сессии проекта" },
@@ -694,6 +700,11 @@ export function createSessionStore(workspace, root = configRoot, { updateLatestP
     if (typeof id !== "string" || !/^[0-9a-f-]{36}$/iu.test(id)) throw new Error("Некорректный ID сессии.")
     return join(directory, `${id}.json`)
   }
+  const checkpointBlobFor = (id, blobId) => {
+    fileFor(id)
+    if (typeof blobId !== "string" || !/^[0-9a-f-]{36}$/iu.test(blobId)) throw new Error("Некорректный ID снимка отката.")
+    return join(directory, `${id}.checkpoint.${blobId}.bin`)
+  }
   const cancelFileFor = (id) => `${fileFor(id)}.cancel`
   const responseFileFor = (id, requestId) => {
     fileFor(id)
@@ -703,7 +714,7 @@ export function createSessionStore(workspace, root = configRoot, { updateLatestP
   return {
     async create(model, mode) {
       const now = new Date().toISOString()
-      return { id: randomUUID(), workspace, model, mode, createdAt: now, updatedAt: now, messages: [], pendingAction: null }
+      return { id: randomUUID(), workspace, model, mode, createdAt: now, updatedAt: now, messages: [], checkpoints: [], activeCheckpointId: null, pendingAction: null }
     },
     async load(id) {
       const file = fileFor(id)
@@ -717,9 +728,14 @@ export function createSessionStore(workspace, root = configRoot, { updateLatestP
           const imagePaths = message.role === "user" && Array.isArray(message.imagePaths)
             ? message.imagePaths.filter((value) => typeof value === "string" && value.length <= 4_096).slice(0, MAX_IMAGES_PER_MESSAGE)
             : []
-          return { role: message.role, content: message.content, ...(imagePaths.length ? { imagePaths } : {}) }
+          const checkpointId = typeof message.checkpointId === "string" && /^[0-9a-f-]{36}$/iu.test(message.checkpointId) ? message.checkpointId : null
+          return { role: message.role, content: message.content, ...(imagePaths.length ? { imagePaths } : {}), ...(checkpointId ? { checkpointId } : {}) }
         })
         .slice(-MAX_HISTORY)
+      data.checkpoints = Array.isArray(data.checkpoints) ? data.checkpoints
+        .filter((checkpoint) => checkpoint && typeof checkpoint === "object" && typeof checkpoint.id === "string" && /^[0-9a-f-]{36}$/iu.test(checkpoint.id))
+        .slice(-MAX_CHECKPOINTS) : []
+      data.activeCheckpointId = data.checkpoints.some((checkpoint) => checkpoint.id === data.activeCheckpointId) ? data.activeCheckpointId : null
       return data
     },
     async latest() {
@@ -792,6 +808,28 @@ export function createSessionStore(workspace, root = configRoot, { updateLatestP
     async clearAgentResponse(id, requestId) {
       try { await unlink(responseFileFor(id, requestId)) } catch (error) { if (error?.code !== "ENOENT") throw error }
     },
+    async writeCheckpointBlob(id, blobId, bytes) {
+      if (!Buffer.isBuffer(bytes) || bytes.length > MAX_CHECKPOINT_BLOB_BYTES) throw new Error("Снимок отката превышает допустимый размер.")
+      await mkdir(directory, { recursive: true, mode: 0o700 })
+      const target = checkpointBlobFor(id, blobId)
+      const handle = await open(target, "wx", 0o600)
+      try {
+        await handle.writeFile(bytes)
+        await handle.sync()
+      } finally {
+        await handle.close()
+      }
+      if (platform !== "win32") await chmod(target, 0o600).catch(() => undefined)
+    },
+    async readCheckpointBlob(id, blobId) {
+      const target = checkpointBlobFor(id, blobId)
+      const info = await stat(target)
+      if (!info.isFile() || info.size > MAX_CHECKPOINT_BLOB_BYTES) throw new Error("Снимок отката повреждён или превышает допустимый размер.")
+      return await readFile(target)
+    },
+    async removeCheckpointBlob(id, blobId) {
+      try { await unlink(checkpointBlobFor(id, blobId)) } catch (error) { if (error?.code !== "ENOENT") throw error }
+    },
     fork({ updateLatestPointer: childUpdatesLatest = false } = {}) {
       return createSessionStore(workspace, root, { updateLatestPointer: childUpdatesLatest })
     },
@@ -832,15 +870,279 @@ export function createSessionStore(workspace, root = configRoot, { updateLatestP
   }
 }
 
-function appendMessage(session, role, content, imagePaths = []) {
+function appendMessage(session, role, content, imagePaths = [], checkpointId = null) {
   const safe = String(content).slice(0, MAX_MESSAGE_CHARS)
-  session.messages.push({ role, content: safe, ...(role === "user" && imagePaths.length ? { imagePaths } : {}) })
+  session.messages.push({ role, content: safe, ...(role === "user" && imagePaths.length ? { imagePaths } : {}), ...(role === "user" && checkpointId ? { checkpointId } : {}) })
   if (session.messages.length > MAX_HISTORY) session.messages.splice(1, session.messages.length - MAX_HISTORY)
   let total = session.messages.reduce((sum, item) => sum + item.content.length, 0)
   while (total > 130_000 && session.messages.length > 2) {
     const [removed] = session.messages.splice(1, 1)
     total -= removed.content.length
   }
+}
+
+function checkpointSha256(bytes) {
+  return createHash("sha256").update(bytes).digest("hex")
+}
+
+async function checkpointTreeState(pathname) {
+  const hash = createHash("sha256")
+  let bytes = 0
+  let entries = 0
+  async function walk(current, relativePath) {
+    const info = await lstat(current)
+    entries++
+    if (entries > MAX_CHECKPOINT_TREE_ENTRIES) throw Object.assign(new Error("too-many-checkpoint-entries"), { code: "CHECKPOINT_LIMIT" })
+    const name = relativePath.split(sep).join("/")
+    if (info.isSymbolicLink()) {
+      hash.update(`link\0${name}\0${await readlink(current)}\0`)
+      return
+    }
+    if (info.isFile()) {
+      bytes += info.size
+      if (bytes > MAX_CHECKPOINT_SESSION_BLOB_BYTES) throw Object.assign(new Error("checkpoint-tree-too-large"), { code: "CHECKPOINT_LIMIT" })
+      hash.update(`file\0${name}\0${info.mode & 0o7777}\0${info.size}\0`)
+      const content = await readFile(current)
+      hash.update(content)
+      return
+    }
+    if (!info.isDirectory()) throw Object.assign(new Error("unsupported-checkpoint-entry"), { code: "CHECKPOINT_LIMIT" })
+    hash.update(`directory\0${name}\0${info.mode & 0o7777}\0`)
+    const children = await readdir(current, { withFileTypes: true })
+    children.sort((left, right) => left.name.localeCompare(right.name))
+    for (const child of children) await walk(join(current, child.name), name ? join(name, child.name) : child.name)
+  }
+  await walk(pathname, "")
+  return { kind: "directory", hash: hash.digest("hex"), bytes, entries }
+}
+
+async function checkpointPathState(pathname) {
+  let info
+  try { info = await lstat(pathname) } catch (error) {
+    if (error?.code === "ENOENT") return { exists: false }
+    throw error
+  }
+  if (info.isSymbolicLink()) return { exists: true, kind: "symlink", hash: checkpointSha256(Buffer.from(await readlink(pathname))), mode: info.mode & 0o7777 }
+  if (info.isDirectory()) return { exists: true, ...(await checkpointTreeState(pathname)), mode: info.mode & 0o7777 }
+  if (!info.isFile()) throw new Error("Откат поддерживает только обычные файлы, папки и ссылки.")
+  if (info.size > MAX_CHECKPOINT_SESSION_BLOB_BYTES) return { exists: true, kind: "file", hash: null, size: info.size, mode: info.mode & 0o7777, tooLarge: true }
+  const content = await readFile(pathname)
+  return { exists: true, kind: "file", hash: checkpointSha256(content), size: content.length, mode: info.mode & 0o7777, content }
+}
+
+async function addCheckpointWarning(session, store, checkpointId, warning) {
+  const checkpoint = session.checkpoints?.find((item) => item.id === checkpointId)
+  if (!checkpoint) return
+  checkpoint.warnings ??= []
+  if (!checkpoint.warnings.includes(warning)) checkpoint.warnings.push(warning.slice(0, 500))
+  await store.save(session)
+}
+
+export async function recordCheckpointChange(session, store, checkpointId, change) {
+  const checkpoint = session.checkpoints?.find((item) => item.id === checkpointId)
+  if (!checkpoint) return false
+  checkpoint.changes ??= []
+  if (checkpoint.changes.length >= MAX_CHECKPOINT_CHANGES) {
+    await addCheckpointWarning(session, store, checkpointId, "Лимит отслеживаемых действий достигнут; часть изменений этого хода может не попасть в откат.")
+    return false
+  }
+  const { snapshot, ...record } = change
+  let snapshotId = null
+  if (snapshot) {
+    const existingBytes = (session.checkpoints ?? []).flatMap((item) => item.changes ?? []).reduce((sum, item) => sum + (Number.isSafeInteger(item.snapshotBytes) ? item.snapshotBytes : 0), 0)
+    if (snapshot.length > MAX_CHECKPOINT_BLOB_BYTES || existingBytes + snapshot.length > MAX_CHECKPOINT_SESSION_BLOB_BYTES) {
+      await addCheckpointWarning(session, store, checkpointId, "Изменён большой файл, снимок которого не поместился в ограничение хранилища; этот файл нельзя восстановить через /rewind.")
+      return false
+    }
+    if (typeof store.writeCheckpointBlob !== "function") {
+      await addCheckpointWarning(session, store, checkpointId, "Хранилище не поддерживает снимки файлов; часть изменений нельзя откатить.")
+      return false
+    }
+    snapshotId = randomUUID()
+    await store.writeCheckpointBlob(session.id, snapshotId, snapshot)
+    record.snapshotId = snapshotId
+    record.snapshotBytes = snapshot.length
+  }
+  checkpoint.changes.push(record)
+  try {
+    await store.save(session)
+  } catch (error) {
+    if (snapshotId) await store.removeCheckpointBlob?.(session.id, snapshotId).catch(() => undefined)
+    checkpoint.changes.pop()
+    throw error
+  }
+  return true
+}
+
+export async function beginTurnCheckpoint(session, store, prompt) {
+  const previous = session.checkpoints?.find((item) => item.id === session.activeCheckpointId)
+  if (previous && previous.status === "active") previous.status = "interrupted"
+  session.checkpoints ??= []
+  const checkpoint = {
+    id: randomUUID(),
+    createdAt: new Date().toISOString(),
+    prompt: String(prompt).replace(/\s+/gu, " ").trim().slice(0, 240),
+    status: "active",
+    changes: [],
+    warnings: [],
+    codeRewound: false,
+    chatRewound: false,
+  }
+  session.checkpoints.push(checkpoint)
+  session.activeCheckpointId = checkpoint.id
+  while (session.checkpoints.length > MAX_CHECKPOINTS) {
+    const removed = session.checkpoints.shift()
+    for (const change of removed.changes ?? []) {
+      if (change.snapshotId) await store.removeCheckpointBlob?.(session.id, change.snapshotId)
+    }
+  }
+  await store.save(session)
+  return checkpoint
+}
+
+async function finishTurnCheckpoint(session, store, status, { updateLatest = true } = {}) {
+  const checkpoint = session.checkpoints?.find((item) => item.id === session.activeCheckpointId)
+  if (!checkpoint) return
+  checkpoint.status = status
+  session.activeCheckpointId = null
+  await store.save(session, { updateLatest })
+}
+
+function rewindableCheckpoints(session) {
+  const messages = new Set((session.messages ?? []).map((message) => message.checkpointId).filter(Boolean))
+  return (session.checkpoints ?? []).filter((checkpoint) => messages.has(checkpoint.id) && (!checkpoint.codeRewound || !checkpoint.chatRewound)).reverse()
+}
+
+async function validateRewindPath(pathname, roots) {
+  if (typeof pathname !== "string" || !isAbsolute(pathname)) throw new Error("Снимок отката содержит некорректный путь.")
+  const resolved = await resolveWorkspacePath(pathname, roots, { allowSensitive: true })
+  if (resolve(resolved) !== resolve(pathname)) throw new Error("Путь снимка изменился; откат остановлен.")
+  const parent = await realpath(dirname(pathname))
+  if (parent !== resolve(dirname(pathname))) throw new Error("Родительская папка снимка изменилась через ссылку; откат остановлен.")
+  return resolved
+}
+
+function checkpointPathMatches(actual, expected) {
+  if (!expected) return !actual.exists
+  return actual.exists && actual.kind === expected.kind && actual.hash === expected.hash && (expected.mode === undefined || actual.mode === expected.mode)
+}
+
+export async function rewindSession(session, store, { roots, number = 1 } = {}) {
+  const choices = rewindableCheckpoints(session)
+  if (!Number.isInteger(number) || number < 1 || number > choices.length) throw new Error(`Нет хода ${number} для отката. Доступно: ${choices.length}.`)
+  const selected = choices[number - 1]
+  const checkpointIndex = session.checkpoints.findIndex((item) => item.id === selected.id)
+  const messageIndex = session.messages.findIndex((message) => message.checkpointId === selected.id)
+  if (messageIndex < 0) throw new Error("Сообщение выбранного хода уже отсутствует в истории; откат не выполнен.")
+  const later = session.checkpoints.slice(checkpointIndex).filter((item) => !item.codeRewound)
+  const plan = []
+  for (const checkpoint of [...later].reverse()) {
+    for (const change of [...(checkpoint.changes ?? [])].reverse()) {
+      if (!["restore_file", "remove_file", "move_path", "remove_directory"].includes(change.kind)) {
+        throw new Error("Снимок содержит неизвестное действие. Откат остановлен без изменений.")
+      }
+      if (change.kind === "move_path") {
+        const source = await validateRewindPath(change.source, roots)
+        const destination = await validateRewindPath(change.destination, roots)
+        plan.push({ checkpoint, change, source, destination })
+      } else {
+        const path = await validateRewindPath(change.path, roots)
+        const snapshot = change.snapshotId ? await store.readCheckpointBlob(session.id, change.snapshotId) : null
+        if (snapshot && checkpointSha256(snapshot) !== change.beforeHash) throw new Error("Снимок файла повреждён; откат остановлен без изменений.")
+        plan.push({ checkpoint, change, path, snapshot })
+      }
+    }
+  }
+
+  const virtual = new Map()
+  const stateAt = async (path) => {
+    if (!virtual.has(path)) virtual.set(path, await checkpointPathState(path))
+    return virtual.get(path)
+  }
+  for (const step of plan) {
+    const { change } = step
+    if (change.kind === "restore_file") {
+      const actual = await stateAt(step.path)
+      const after = change.afterExists ? { kind: "file", hash: change.afterHash, mode: change.afterMode } : null
+      const before = change.beforeExists ? { kind: "file", hash: change.beforeHash, mode: change.beforeMode } : null
+      const matchesAfter = checkpointPathMatches(actual, after)
+      const matchesBefore = checkpointPathMatches(actual, before)
+      if (!matchesAfter && !matchesBefore) throw new Error(`Файл изменён после хода: ${displayPath(step.path, roots)}. Откат остановлен без изменений.`)
+      if (change.beforeExists && !step.snapshot) throw new Error(`Нет снимка исходного файла: ${displayPath(step.path, roots)}. Откат остановлен без изменений.`)
+      step.noop = matchesBefore
+      virtual.set(step.path, change.beforeExists ? { exists: true, kind: "file", hash: change.beforeHash, mode: change.beforeMode } : { exists: false })
+    } else if (change.kind === "remove_file") {
+      const actual = await stateAt(step.path)
+      if (actual.exists && !checkpointPathMatches(actual, { kind: "file", hash: change.afterHash, mode: change.afterMode })) throw new Error(`Копия изменилась после хода: ${displayPath(step.path, roots)}. Откат остановлен без изменений.`)
+      step.noop = !actual.exists
+      virtual.set(step.path, { exists: false })
+    } else if (change.kind === "move_path") {
+      const sourceState = await stateAt(step.source)
+      const destinationState = await stateAt(step.destination)
+      const expected = { kind: change.entryKind, hash: change.expectedHash, mode: change.expectedMode }
+      const sourceIsBefore = checkpointPathMatches(sourceState, expected) && !destinationState.exists
+      const isAfter = !sourceState.exists && checkpointPathMatches(destinationState, expected)
+      if (!sourceIsBefore && !isAfter) {
+        throw new Error(`Пути перемещения изменились после хода: ${displayPath(step.destination, roots)}. Откат остановлен без изменений.`)
+      }
+      step.noop = sourceIsBefore
+      virtual.set(step.source, { exists: true, kind: change.entryKind, hash: change.expectedHash, mode: change.expectedMode })
+      virtual.set(step.destination, { exists: false })
+    } else {
+      const actual = await stateAt(step.path)
+      if (actual.exists && actual.kind !== "directory") throw new Error(`Папка изменилась после хода: ${displayPath(step.path, roots)}. Откат остановлен без изменений.`)
+      step.noop = !actual.exists
+      virtual.set(step.path, { exists: false })
+    }
+  }
+
+  let reverted = 0
+  for (const step of plan) {
+    if (step.noop) continue
+    const { change } = step
+    if (change.kind === "restore_file") {
+      const current = await checkpointPathState(step.path)
+      const after = change.afterExists ? { kind: "file", hash: change.afterHash, mode: change.afterMode } : null
+      if (!checkpointPathMatches(current, after)) throw new Error(`Откат остановился: файл успели изменить ${displayPath(step.path, roots)}.`)
+      if (change.beforeExists) {
+        await writeFile(step.path, step.snapshot, { mode: change.beforeMode ?? 0o600 })
+        if (Number.isInteger(change.beforeMode)) await chmod(step.path, change.beforeMode).catch(() => undefined)
+      } else if (current.exists) await unlink(step.path)
+    } else if (change.kind === "remove_file") {
+      const current = await checkpointPathState(step.path)
+      if (!checkpointPathMatches(current, { kind: "file", hash: change.afterHash, mode: change.afterMode })) throw new Error(`Откат остановился: копию успели изменить ${displayPath(step.path, roots)}.`)
+      await unlink(step.path)
+    } else if (change.kind === "move_path") {
+      const sourceState = await checkpointPathState(step.source)
+      const destinationState = await checkpointPathState(step.destination)
+      if (sourceState.exists || !checkpointPathMatches(destinationState, { kind: change.entryKind, hash: change.expectedHash, mode: change.expectedMode })) {
+        throw new Error(`Откат остановился: путь перемещения успели изменить ${displayPath(step.destination, roots)}.`)
+      }
+      await rename(step.destination, step.source)
+    } else {
+      const current = await checkpointPathState(step.path)
+      if (!current.exists) continue
+      if (current.kind !== "directory" || (await readdir(step.path)).length) throw new Error(`Откат остановился: папка не пуста ${displayPath(step.path, roots)}.`)
+      await rmdir(step.path)
+    }
+    reverted++
+  }
+
+  session.messages.splice(messageIndex)
+  for (const checkpoint of session.checkpoints.slice(checkpointIndex)) {
+    checkpoint.codeRewound = true
+    checkpoint.chatRewound = true
+    checkpoint.status = "rewound"
+    for (const change of checkpoint.changes ?? []) {
+      if (change.snapshotId) await store.removeCheckpointBlob?.(session.id, change.snapshotId)
+    }
+    checkpoint.changes = []
+  }
+  session.activeCheckpointId = null
+  session.pendingAction = null
+  session.pendingQuestion = null
+  await store.save(session)
+  return { prompt: selected.prompt, reverted, warnings: later.flatMap((checkpoint) => checkpoint.warnings ?? []) }
 }
 
 const TERMINAL_AGENT_JOB_STATES = new Set(["completed", "needs_input", "failed", "cancelled", "interrupted"])
@@ -908,6 +1210,8 @@ export async function startBackgroundAgentTask({ store, workspace, model, task, 
     ? `Исследуй проект по задаче:\n${task.trim()}\n\nРаботай только в режиме чтения. Не меняй файлы и не запускай команды. В конце верни проверенные выводы и пути к найденным файлам.`
     : `Выполни задачу в проекте как самостоятельный агент разработки:\n${task.trim()}\n\nИзучи существующий код и инструкции проекта. Используй инструменты для реализации задачи и доведи её до работающего результата. Перед каждым изменением файла, запуском команды, вызовом MCP или hook дождись подтверждения пользователя. В конце кратко перечисли изменения и результаты проверок.`
   appendMessage(session, "user", instructions)
+  const checkpoint = await beginTurnCheckpoint(session, childStore, task.trim())
+  session.messages[0].checkpointId = checkpoint.id
   await childStore.clearCancel(session.id)
   await childStore.save(session, { updateLatest: false })
   return await spawnBackgroundAgentProcess({ store: childStore, workspace, session, spawnImpl, entrypoint })
@@ -927,6 +1231,7 @@ export async function runBackgroundAgentWorker({ id, workspace, store, config, f
       finishedAt: new Date().toISOString(),
       error: error ? redactSecrets(error instanceof Error ? error.message : String(error)).slice(0, 800) : null,
     }
+    await finishTurnCheckpoint(session, store, status === "needs_input" ? "needs_input" : status === "completed" ? "completed" : status === "cancelled" ? "interrupted" : "failed", { updateLatest: false })
     delete session.agentJob.approval
     await store.clearCancel(id)
     await store.save(session, { updateLatest: false })
@@ -1239,7 +1544,7 @@ async function runShell(command, workspace, abortSignal, onOutputChunk) {
   })
 }
 
-export async function executeTool(action, { workspace, roots, approve, question, delegate, webSearch, onToolOutput, signal }) {
+export async function executeTool(action, { workspace, roots, approve, question, delegate, webSearch, onToolOutput, onCheckpoint, signal }) {
   const input = action.input || {}
   const getPath = (name = "path", required = true) => {
     const value = input[name]
@@ -1328,11 +1633,31 @@ export async function executeTool(action, { workspace, roots, approve, question,
     } else target = await resolveWorkspacePath(getPath(), roots, { allowSensitive: true })
     await assertParentAllowed(target, allowedRoots)
     if (!(await askApproval(action, { approve, question }))) return { output: "Действие отклонено пользователем." }
+    if (location === "desktop") await onCheckpoint?.({ kind: "unsupported", warning: "Папка создана на рабочем столе вне разрешённых корней проекта; /rewind не меняет её." })
+    else {
+      const allowedRoot = roots.find((root) => within(root, target))
+      const missing = []
+      let cursor = target
+      while (within(allowedRoot, cursor)) {
+        try {
+          const info = await lstat(cursor)
+          if (!info.isDirectory()) throw new Error("Один из родительских путей уже занят файлом.")
+          break
+        } catch (error) {
+          if (error?.code !== "ENOENT") throw error
+          missing.push(cursor)
+          if (cursor === allowedRoot) break
+          cursor = dirname(cursor)
+        }
+      }
+      for (const path of missing.reverse()) await onCheckpoint?.({ kind: "remove_directory", path })
+    }
     await mkdir(target, { recursive: true })
     return { output: `Папка создана: ${target}` }
   }
   if (action.name === "run_command") {
     if (!(await askApproval(action, { approve, question }))) return { output: "Действие отклонено пользователем." }
+    await onCheckpoint?.({ kind: "unsupported", warning: "Shell-команда могла изменить файлы, но CLI не может надёжно определить её побочные эффекты." })
     let result
     try {
       result = await runShell(getPath("command"), workspace, signal, onToolOutput)
@@ -1353,8 +1678,23 @@ export async function executeTool(action, { workspace, roots, approve, question,
     await assertParentAllowed(destination, roots)
     if (await access(destination).then(() => true, () => false)) throw new Error("Путь назначения уже существует.")
     if (!(await askApproval(action, { approve, question }))) return { output: "Действие отклонено пользователем." }
-    if (action.name === "copy_file") await copyFile(source, destination)
-    else await rename(source, destination)
+    if (action.name === "copy_file") {
+      const sourceState = await checkpointPathState(source)
+      if (!sourceState.exists || sourceState.kind !== "file" || sourceState.tooLarge) {
+        await onCheckpoint?.({ kind: "unsupported", warning: "Копия создана, но её содержимое слишком велико или нестандартно для проверки отката." })
+      } else {
+        await onCheckpoint?.({ kind: "remove_file", path: destination, afterHash: sourceState.hash, afterMode: sourceState.mode })
+      }
+      await copyFile(source, destination)
+    } else {
+      const sourceState = await checkpointPathState(source)
+      if (!sourceState.exists || !sourceState.hash) {
+        await onCheckpoint?.({ kind: "unsupported", warning: "Перемещение выполнено, но его содержимое превышает ограничения проверки отката." })
+      } else {
+        await onCheckpoint?.({ kind: "move_path", source, destination, entryKind: sourceState.kind, expectedHash: sourceState.hash, expectedMode: sourceState.mode })
+      }
+      await rename(source, destination)
+    }
     return { output: `${action.name === "copy_file" ? "Скопировано" : "Перемещено"}: ${displayPath(destination, roots)}` }
   }
   const file = await resolveWorkspacePath(getPath(), roots, { allowSensitive: action.name === "delete_file" })
@@ -1365,6 +1705,24 @@ export async function executeTool(action, { workspace, roots, approve, question,
     const exists = await access(file).then(() => true, () => false)
     if (exists && !(await stat(file)).isFile()) throw new Error("Путь уже существует и не является обычным файлом.")
     if (!(await askApproval(action, { approve, question }))) return { output: "Действие отклонено пользователем." }
+    const trackedPath = exists ? await realpath(file) : file
+    const beforeState = await checkpointPathState(trackedPath)
+    if (beforeState.exists && (beforeState.kind !== "file" || beforeState.tooLarge)) {
+      await onCheckpoint?.({ kind: "unsupported", warning: `Файл ${displayPath(trackedPath, roots)} изменён, но его исходное содержимое превышает ограничения снимка.` })
+    } else {
+      const afterBytes = Buffer.from(content, "utf8")
+      await onCheckpoint?.({
+        kind: "restore_file",
+        path: trackedPath,
+        beforeExists: beforeState.exists,
+        beforeHash: beforeState.exists ? beforeState.hash : null,
+        beforeMode: beforeState.exists ? beforeState.mode : null,
+        afterExists: true,
+        afterHash: checkpointSha256(afterBytes),
+        afterMode: beforeState.exists ? beforeState.mode : 0o600,
+        ...(beforeState.exists ? { snapshot: beforeState.content } : {}),
+      })
+    }
     await writeFile(file, content, { encoding: "utf8", mode: 0o600 })
     return { output: `${exists ? "Файл обновлён" : "Файл создан"}: ${displayPath(file, roots)} (${Buffer.byteLength(content)} байт)` }
   }
@@ -1378,6 +1736,22 @@ export async function executeTool(action, { workspace, roots, approve, question,
     const updated = current.slice(0, first) + newText + current.slice(first + oldText.length)
     if (Buffer.byteLength(updated, "utf8") > MAX_WRITE_BYTES) throw new Error("Размер файла после изменения превышает 500 КБ.")
     if (!(await askApproval(action, { approve, question }))) return { output: "Действие отклонено пользователем." }
+    const trackedPath = await realpath(file)
+    const beforeState = await checkpointPathState(trackedPath)
+    if (!beforeState.exists || beforeState.kind !== "file" || beforeState.tooLarge || beforeState.content.toString("utf8") !== current) {
+      throw new Error("Файл изменился после чтения или не помещается в снимок отката. Перечитайте его и повторите действие.")
+    }
+    await onCheckpoint?.({
+      kind: "restore_file",
+      path: trackedPath,
+      beforeExists: true,
+      beforeHash: beforeState.hash,
+      beforeMode: beforeState.mode,
+      afterExists: true,
+      afterHash: checkpointSha256(Buffer.from(updated, "utf8")),
+      afterMode: beforeState.mode,
+      snapshot: beforeState.content,
+    })
     await writeFile(file, updated, "utf8")
     return { output: `Файл изменён: ${displayPath(file, roots)}` }
   }
@@ -1385,6 +1759,21 @@ export async function executeTool(action, { workspace, roots, approve, question,
     const existing = await resolveWorkspacePath(getPath(), roots, { mustExist: true, allowSensitive: true })
     if (!(await stat(existing)).isFile()) throw new Error("Удаление папок этим инструментом запрещено.")
     if (!(await askApproval(action, { approve, question }))) return { output: "Действие отклонено пользователем." }
+    const beforeState = await checkpointPathState(existing)
+    if (beforeState.kind !== "file" || beforeState.tooLarge) {
+      await onCheckpoint?.({ kind: "unsupported", warning: "Файл удалён, но его размер не позволяет сохранить снимок для /rewind." })
+    } else {
+      await onCheckpoint?.({
+        kind: "restore_file",
+        path: existing,
+        beforeExists: true,
+        beforeHash: beforeState.hash,
+        beforeMode: beforeState.mode,
+        afterExists: false,
+        afterHash: null,
+        snapshot: beforeState.content,
+      })
+    }
     await unlink(existing)
     return { output: `Файл удалён: ${displayPath(existing, roots)}` }
   }
@@ -1712,6 +2101,9 @@ export async function runAgentTask({ config, catalog, session, store, roots, wor
   const hookConfig = session.mode === "build"
     ? await loadConfiguredHooks({ roots, userConfigPath: join(configRoot, "hooks.json") })
     : { hooks: [], issues: [] }
+  if (session.activeCheckpointId && hookConfig.hooks.some((hook) => ["beforeTool", "afterTool"].includes(hook.event))) {
+    await addCheckpointWarning(session, store, session.activeCheckpointId, "Настроенные hooks могли изменить файлы вне прямых инструментов DreyzeCode.")
+  }
   for (const issue of hookConfig.issues) stderr.write(`Hook: ${redactSecrets(issue)}\n`)
   const approvedProjectHooks = new Set()
   const mcp = session.mode === "build"
@@ -1823,6 +2215,10 @@ export async function runAgentTask({ config, catalog, session, store, roots, wor
       await store.save(session)
     }
     assertAgentNotCancelled(signal)
+    if (mcpAction) {
+      const checkpointId = session.activeCheckpointId
+      if (checkpointId) await addCheckpointWarning(session, store, checkpointId, `MCP-инструмент ${action.name} мог изменить данные вне файлового журнала отката.`)
+    }
     let result
     const stopActivity = action.name === "ask_user"
       ? () => {}
@@ -1836,6 +2232,15 @@ export async function runAgentTask({ config, catalog, session, store, roots, wor
         yes: true,
         onToolOutput,
         signal,
+        onCheckpoint: async (change) => {
+          const checkpointId = session.activeCheckpointId
+          if (!checkpointId) return
+          if (change.kind === "unsupported") {
+            await addCheckpointWarning(session, store, checkpointId, change.warning || "Одно из действий невозможно безопасно включить в откат.")
+            return
+          }
+          await recordCheckpointChange(session, store, checkpointId, change)
+        },
         delegate: async (task) => {
           if (typeof store.fork !== "function") throw new Error("Не удалось создать отдельную сессию подагента.")
           const subagentStore = store.fork()
@@ -2502,7 +2907,12 @@ export async function answerBackgroundAgent({ workspace, id, answer, store = cre
     throw new Error(`Фоновый агент ${id} не ожидает ответа.`)
   }
   const question = session.pendingQuestion
-  appendMessage(session, "user", `Ответ на уточнение «${question}»: ${answer.trim()}`)
+  const checkpoint = session.checkpoints?.findLast((item) => item.status === "needs_input")
+  if (checkpoint) {
+    checkpoint.status = "active"
+    session.activeCheckpointId = checkpoint.id
+  }
+  appendMessage(session, "user", `Ответ на уточнение «${question}»: ${answer.trim()}`, [], checkpoint?.id ?? null)
   session.pendingQuestion = null
   session.agentJob.status = "starting"
   session.agentJob.question = null
@@ -2691,9 +3101,10 @@ async function runPrompt(prompt, options, config, catalog, session, store, roots
   }
   const pendingQuestion = session.pendingQuestion
   session.pendingQuestion = null
-  if (options.addDirs.length) appendMessage(session, "user", `Дополнительные папки, явно разрешённые для этой сессии: ${roots.slice(1).join(", ")}. Используй абсолютные пути внутри них, если это необходимо.`)
-  if (pendingQuestion) appendMessage(session, "user", `Ответ на уточнение «${pendingQuestion}»: ${prompt}`, imagePaths)
-  else appendMessage(session, "user", prompt, imagePaths)
+  const checkpoint = await beginTurnCheckpoint(session, store, prompt)
+  if (options.addDirs.length) appendMessage(session, "user", `Дополнительные папки, явно разрешённые для этой сессии: ${roots.slice(1).join(", ")}. Используй абсолютные пути внутри них, если это необходимо.`, [], checkpoint.id)
+  if (pendingQuestion) appendMessage(session, "user", `Ответ на уточнение «${pendingQuestion}»: ${prompt}`, imagePaths, checkpoint.id)
+  else appendMessage(session, "user", prompt, imagePaths, checkpoint.id)
   await store.save(session)
   const streamJson = options.outputFormat === "stream-json"
   const emit = streamJson ? createStreamJsonEmitter() : null
@@ -2716,7 +3127,9 @@ async function runPrompt(prompt, options, config, catalog, session, store, roots
       },
       signal: cancellation.signal,
     })
+    await finishTurnCheckpoint(session, store, result.requiresInput ? "needs_input" : "completed")
   } catch (error) {
+    await finishTurnCheckpoint(session, store, cancellation.signal.aborted ? "interrupted" : "failed")
     if (emit) {
       emit("error", { code: error?.code || "DREYZE_CODE_ERROR", message: redactSecrets(error instanceof Error ? error.message : "Не удалось выполнить задачу.") })
       process.exitCode = 1
@@ -2751,10 +3164,31 @@ export async function resumeInteractiveSession({
   onOutput = (text) => stdout.write(`${text}\n`),
 }) {
   if (!options.continuing) return false
+  if (!session.pendingQuestion && !recovered && session.messages.at(-1)?.role !== "user") return false
   const cancellation = new AbortController()
   const progress = createTerminalProgressCallbacks({ streamOutput: !options.json })
   questioner.setInterruptHandler?.(() => cancellation.abort())
   try {
+    let checkpoint = null
+    if (typeof store?.save === "function") {
+      checkpoint = session.checkpoints?.find((item) => item.id === session.activeCheckpointId)
+      if (!checkpoint) {
+        checkpoint = session.checkpoints?.findLast((item) => ["needs_input", "interrupted"].includes(item.status))
+        if (checkpoint) {
+          checkpoint.status = "active"
+          session.activeCheckpointId = checkpoint.id
+          await store.save(session)
+        } else {
+          const priorPrompt = session.messages.findLast((message) => message.role === "user")?.content || "Продолжение сохранённой сессии"
+          checkpoint = await beginTurnCheckpoint(session, store, priorPrompt)
+          const lastUser = session.messages.findLast((message) => message.role === "user")
+          if (lastUser && !lastUser.checkpointId) {
+            lastUser.checkpointId = checkpoint.id
+            await store.save(session)
+          }
+        }
+      }
+    }
     if (session.pendingQuestion) {
       const pendingQuestion = session.pendingQuestion
       const answer = await questioner.ask(`${pendingQuestion}: `)
@@ -2764,13 +3198,13 @@ export async function resumeInteractiveSession({
       }
       assertAgentNotCancelled(cancellation.signal)
       session.pendingQuestion = null
-      appendMessage(session, "user", `Ответ на уточнение «${pendingQuestion}»: ${answer}`)
+      appendMessage(session, "user", `Ответ на уточнение «${pendingQuestion}»: ${answer}`, [], checkpoint?.id ?? null)
       await store.save(session)
     }
 
     const last = session.messages.at(-1)
     if (!recovered && last?.role !== "user") return false
-    await runTask({
+    const result = await runTask({
       config,
       catalog,
       session,
@@ -2784,8 +3218,10 @@ export async function resumeInteractiveSession({
       onToolOutput: progress.onToolOutput,
       signal: cancellation.signal,
     })
+    if (session.activeCheckpointId && typeof store?.save === "function") await finishTurnCheckpoint(session, store, result?.requiresInput ? "needs_input" : "completed")
     return true
   } catch (error) {
+    if (session.activeCheckpointId && typeof store?.save === "function") await finishTurnCheckpoint(session, store, cancellation.signal.aborted ? "interrupted" : "failed")
     if (!cancellation.signal.aborted) throw error
     await store.save(session)
     onOutput("Задача остановлена. Сессия сохранена; продолжите через dreyzecode --continue.")
@@ -2982,6 +3418,35 @@ async function interactive(options, config, catalog, initialSession, store, root
         const requested = value ? Number(value) : DEFAULT_HISTORY_DISPLAY_MESSAGES
         if (!Number.isInteger(requested) || requested < 1) writeChatMessage("История чата", "Использование: /history [число от 1 до 30].", color)
         else printSessionHistory(Math.min(requested, MAX_HISTORY_DISPLAY_MESSAGES))
+        continue
+      }
+      if (name === "rewind") {
+        const choices = rewindableCheckpoints(session)
+        if (!value) {
+          const rows = choices.slice(0, 20).map((checkpoint, index) => `${index + 1}. ${new Date(checkpoint.createdAt).toLocaleString()} · ${checkpoint.changes?.length || 0} файловых действий\n   ${redactSecrets(checkpoint.prompt || "Ход без текста")}${checkpoint.warnings?.length ? `\n   Есть действия вне журнала отката` : ""}`)
+          writeChatMessage("Откат хода", rows.length ? `${rows.join("\n\n")}\n\nИспользуйте /rewind 1 для самого последнего хода.` : "Нет сохранённых ходов для отката.", color)
+          continue
+        }
+        const requested = Number(value)
+        if (!/^\d+$/u.test(value) || !Number.isSafeInteger(requested) || requested < 1 || requested > choices.length) {
+          writeChatMessage("Откат хода", `Укажите номер от 1 до ${choices.length}. Сначала введите /rewind, чтобы посмотреть список.`, color)
+          continue
+        }
+        const selected = choices[requested - 1]
+        const pendingChanges = session.checkpoints.slice(session.checkpoints.findIndex((item) => item.id === selected.id)).filter((item) => !item.codeRewound).reduce((sum, item) => sum + (item.changes?.length || 0), 0)
+        const caveat = "Команды shell, MCP и hooks не входят в файловый журнал. Изменения, сделанные вне прямых инструментов CLI, останутся."
+        const answer = await questioner.ask(`Откатить «${redactSecrets(selected.prompt || "ход") }» и убрать его сообщения? Будет проверено файловых действий: ${pendingChanges}. ${caveat} [y/N] `)
+        if (!/^(y|yes|д|да)$/iu.test(String(answer || "").trim())) {
+          writeChatMessage("Откат отменён", "Файлы и история сессии не изменены.", color)
+          continue
+        }
+        try {
+          const result = await rewindSession(session, store, { roots, number: requested })
+          const warning = result.warnings.length ? `\n\nОткат не затрагивает: ${result.warnings.join(" ")}` : ""
+          writeChatMessage("Ход отменён", `Восстановлены изменения выбранного хода и последующих ходов. Обратных файловых действий: ${result.reverted}.${warning}`, color)
+        } catch (error) {
+          writeChatMessage("Откат остановлен", error instanceof Error ? error.message : "Не удалось безопасно откатить ход.", color)
+        }
         continue
       }
       if (name === "copy") {
