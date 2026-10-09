@@ -89,6 +89,11 @@ later edits are preserved. It tracks direct file and folder tools only; shell
 commands, MCP tools, hooks, desktop folders, and oversized snapshots may not be
 reversible. Checkpoints are local to the saved session and are not a substitute
 for Git.
+Use `/context` to inspect the active history size and a rough token estimate.
+Use `/compact [focus]` when you want a shorter working context: the selected
+Dreyze model drafts a summary, shows it for review, and asks before replacing
+the active history. The original recent transcript stays in the local session
+archive for `/history` and `/rewind`; compaction never clears the session.
 Prefix a message with `//` when it should start with a literal `/`.
 Press Ctrl+C during a task to stop the current model request or running command;
 the session is saved so you can continue with `dreyzecode --continue`. If a

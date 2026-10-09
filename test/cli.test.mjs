@@ -21,6 +21,8 @@ import {
   buildSkillPrompt,
   backgroundAgentStatus,
   completeSlashInput,
+  compactSessionHistory,
+  contextUsage,
   createSkillScaffold,
   executeTool,
   fetchModelCatalog,
@@ -35,6 +37,7 @@ import {
   parseArgs,
   parseSlashCommand,
   readStdinPrompt,
+  requestConversationSummary,
   redactSecrets,
   recoverPendingAction,
   resumeInteractiveSession,
@@ -1578,6 +1581,74 @@ test("trims only the oldest session messages needed to stay within the history b
   assert.equal(session.messages.some((message) => message.content.startsWith("message-9 ")), true)
 })
 
+test("context inspection estimates active history and compaction preserves a local transcript archive", async (t) => {
+  const { workspace, config } = await fixture(t)
+  const store = createSessionStore(workspace, config)
+  const session = await store.create("dreyze/test-model", "build")
+  session.messages = [
+    { role: "user", content: "Keep the existing login flow." },
+    { role: "assistant", content: "I will preserve it." },
+  ]
+  const before = contextUsage(session, { contextLength: 32_000 })
+  assert.equal(before.messages, 2)
+  assert.equal(before.tokenEstimate, 12)
+  assert.equal(before.modelPercent, 0)
+
+  const compacted = compactSessionHistory(session, "Keep the login flow and continue with the requested changes.")
+  assert.equal(compacted.archivedMessages, 2)
+  assert.equal(session.messages.length, 1)
+  assert.match(session.messages[0].content, /Сжатый контекст DreyzeCode/u)
+  assert.deepEqual(visibleSessionMessages(session, 10).map((message) => message.content), ["Keep the existing login flow.", "I will preserve it."])
+  await store.save(session)
+  const loaded = await store.load(session.id)
+  assert.equal(loaded.compactedMessages.length, 2)
+  assert.match(loaded.messages[0].content, /continue with the requested changes/u)
+})
+
+test("rewind can find and restore the conversation boundary from a compacted archive", async (t) => {
+  const { workspace, config } = await fixture(t)
+  const store = createSessionStore(workspace, config)
+  const session = await store.create("dreyze/test-model", "build")
+  const oldCheckpoint = { id: "11111111-1111-4111-8111-111111111111", createdAt: new Date().toISOString(), prompt: "Old task", status: "completed", changes: [], warnings: [], codeRewound: false, chatRewound: false }
+  session.checkpoints.push(oldCheckpoint)
+  session.messages.push({ role: "user", content: "Old task", checkpointId: oldCheckpoint.id })
+  session.messages.push({ role: "assistant", content: "Old answer" })
+  compactSessionHistory(session, "Old task was completed.")
+  const currentCheckpoint = { id: "22222222-2222-4222-8222-222222222222", createdAt: new Date().toISOString(), prompt: "New task", status: "completed", changes: [], warnings: [], codeRewound: false, chatRewound: false }
+  session.checkpoints.push(currentCheckpoint)
+  session.messages.push({ role: "user", content: "New task", checkpointId: currentCheckpoint.id })
+  session.messages.push({ role: "assistant", content: "New answer" })
+  await store.save(session)
+
+  const result = await rewindSession(session, store, { roots: [workspace], number: 2 })
+  assert.equal(result.prompt, "Old task")
+  assert.deepEqual(session.compactedMessages, [])
+  assert.deepEqual(session.messages, [])
+  assert.equal(oldCheckpoint.chatRewound, true)
+  assert.equal(currentCheckpoint.chatRewound, true)
+})
+
+test("conversation compaction asks the selected Dreyze model for a summary without passing tools", async (t) => {
+  const { workspace } = await fixture(t)
+  const session = { id: "session", model: "dreyze/test-model", mode: "build", messages: [{ role: "user", content: "Keep the API stable." }] }
+  const summary = await requestConversationSummary({
+    config: { url: "https://moonfacet.example", cookie: "session" },
+    catalog: { models: [{ id: session.model, contextLength: 8_192 }] },
+    session,
+    roots: [workspace],
+    fetchImpl: async (_url, init) => {
+      const request = JSON.parse(init.body)
+      assert.equal(request.mode, "plan")
+      assert.deepEqual(request.projectInstructions, [])
+      assert.deepEqual(request.projectSkills, [])
+      assert.deepEqual(request.mcpTools, [])
+      assert.match(request.messages[0].content, /Keep the API stable/u)
+      return Response.json({ type: "final", content: "Preserve the API and existing architecture." })
+    },
+  })
+  assert.equal(summary, "Preserve the API and existing architecture.")
+})
+
 test("does not execute a duplicate tool action and lets the model recover", async (t) => {
   const { workspace, config } = await fixture(t)
   const store = createSessionStore(workspace, config)
@@ -1865,7 +1936,7 @@ test("runs the CLI when invoked through the symlink npm creates for its binary",
   await symlink(cli, command, "file")
   const child = spawnSync(command, ["--version"], { encoding: "utf8" })
   assert.equal(child.status, 0, child.stderr)
-  assert.equal(child.stdout, "DreyzeCode 0.5.28\n")
+  assert.equal(child.stdout, "DreyzeCode 0.5.29\n")
 })
 
 test("help documents image input in both one-shot and interactive modes", async () => {
