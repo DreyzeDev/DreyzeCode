@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url"
 import { connectMcpServers, listConfiguredMcpServers } from "./mcp-client.mjs"
 import { describeHooks, loadConfiguredHooks, runHookEvent } from "./hooks.mjs"
 
-export const VERSION = "0.5.19"
+export const VERSION = "0.5.20"
 const MAX_STEPS = 80
 const MAX_HISTORY = 40
 const DEFAULT_HISTORY_DISPLAY_MESSAGES = 8
@@ -461,9 +461,9 @@ export function formatChatMessage(title, content, requestedWidth = 76) {
 }
 
 export function formatChatComposer(requestedWidth = 76, { model = "модель", mode = "build", attachments = [] } = {}) {
-  const modeLabel = mode === "plan" ? "Plan" : "Build"
+  const modeLabel = mode === "plan" ? "Plan · только чтение" : "Build · изменения с подтверждением"
   const attachmentLabel = attachments.length ? attachments.join(", ") : "нет"
-  const content = `Enter — отправить · / — команды · Tab — дополнить\n${model} · ${modeLabel} · вложения: ${attachmentLabel}`
+  const content = `Задача · Enter — отправить\n/ — команды · ↑↓ выбрать · Tab — вставить\nМодель: ${model}\nРежим: ${modeLabel}\nИзображения: ${attachmentLabel}`
   const frame = formatChatMessage("Новое сообщение", content, requestedWidth).split("\n")
   return {
     hint: frame.slice(1, -1).join("\n"),
@@ -494,7 +494,7 @@ function printHelp() {
     `  dreyzecode api get /api/...            безопасный GET к API Dreyze\n\n` +
     `Параметры: --model ID, --mode build|plan, --add-dir PATH, --image PATH (повторяемый), --session ID, --json, --yes\n` +
     `В Build изменения файлов и команды требуют подтверждения. Plan разрешает только чтение.\n` +
-    `В интерактивном режиме: подсказки появляются при вводе /; Enter / открывает полный список.\n` +
+    `В интерактивном режиме: подсказки появляются при вводе /; ↑↓ выбирают, Tab вставляет команду. Enter / открывает полный список.\n` +
     `Tab дополняет команды Dreyze, личные и проектные skills, режимы, темы и модели.\n` +
     `Ctrl+C останавливает текущую задачу, сохраняя сессию; /exit завершает чат.\n` +
     `Команды: /help, /skills, /hooks, /review, /init, /mode, /model, /attach, /detach, /theme, /status, /history, /copy, /rename, /sessions, /resume, /new, /clear, /exit.\n` +
@@ -1737,6 +1737,8 @@ function promptInterface(jsonMode = false, catalog = { models: [] }) {
   let paletteVisible = false
   let paletteAnchorRow = 0
   let paletteColor = (text) => text
+  let paletteSelection = 0
+  let paletteSelectionLine = ""
   let paletteRenderTimer = null
   let interruptHandler = null
   let pendingAnswerResolver = null
@@ -1764,15 +1766,52 @@ function promptInterface(jsonMode = false, catalog = { models: [] }) {
     const suggestions = slashCommandSuggestions(rl.line, catalog)
     if (!suggestions.length) return
     const shown = suggestions.slice(0, 7)
-    const rows = shown.map(({ usage, description }) => `${usage.padEnd(24)} ${description}`)
-    if (suggestions.length > shown.length) rows.push(`… ещё ${suggestions.length - shown.length} команд · Tab — дополнить`)
-    else if (suggestions.length) rows.push("Tab — дополнить · Enter / — полный список")
+    if (paletteSelectionLine !== rl.line) {
+      paletteSelectionLine = rl.line
+      paletteSelection = 0
+    }
     const width = Math.max(32, Math.min(76, Number(output.columns) || 76))
+    const contentWidth = width - 4
+    const usageWidth = Math.min(24, contentWidth - 4)
+    const descriptionWidth = Math.max(1, contentWidth - usageWidth - 2)
+    const truncate = (value, maxWidth) => terminalCellWidth(value) > maxWidth
+      ? `${takeTerminalCells(value, Math.max(0, maxWidth - 1))}…`
+      : value
+    const rows = shown.map(({ usage, description }) => {
+      const label = truncate(usage, usageWidth)
+      const detail = truncate(description, descriptionWidth)
+      return `${label}${" ".repeat(Math.max(2, usageWidth - terminalCellWidth(label) + 2))}${detail}`
+    })
+    if (suggestions.length > shown.length) rows.push(truncate(`… ещё ${suggestions.length - shown.length} команд · Tab — дополнить`, contentWidth))
+    else if (suggestions.length) rows.push(truncate("↑↓ выбрать · Tab — вставить · Enter — отправить", contentWidth))
     const panel = formatChatMessage("Команды DreyzeCode", rows.join("\n"), width).split("\n")
     const position = rl.getCursorPos()
     paletteAnchorRow = position.rows + 1
-    output.write(`\u001b[s\r\n${panel.map((line, index) => index === 0 || index === panel.length - 1 ? paletteColor(line) : line).join("\r\n")}\u001b[u`)
+    const rendered = panel.map((line, index) => {
+      if (index === 0 || index === panel.length - 1) return paletteColor(line)
+      const suggestionIndex = index - 1
+      if (suggestionIndex !== paletteSelection || suggestionIndex >= shown.length || env.NO_COLOR !== undefined) return line
+      return `\u001b[7m${line}\u001b[27m`
+    })
+    output.write(`\u001b[s\r\n${rendered.join("\r\n")}\u001b[u`)
     paletteVisible = true
+  }
+
+  const onPaletteNavigation = (_character, key) => {
+    if (!promptActive || (key?.name !== "up" && key?.name !== "down")) return
+    const suggestions = slashCommandSuggestions(rl.line, catalog).slice(0, 7)
+    if (!suggestions.length) return
+    if (paletteSelectionLine !== rl.line) {
+      paletteSelectionLine = rl.line
+      paletteSelection = 0
+    } else if (key.name === "down") {
+      paletteSelection = (paletteSelection + 1) % suggestions.length
+    } else {
+      paletteSelection = (paletteSelection - 1 + suggestions.length) % suggestions.length
+    }
+    key.name = "dreyze-palette-navigation"
+    clearPalette()
+    drawPalette()
   }
 
   const onKeypress = (_character, key) => {
@@ -1781,6 +1820,26 @@ function promptInterface(jsonMode = false, catalog = { models: [] }) {
       const tabWasInserted = rl.line.endsWith("\t") && rl.cursor === rl.line.length
       const lineBeforeCompletion = tabWasInserted ? rl.line.slice(0, -1) : rl.line
       const slashInput = lineBeforeCompletion.startsWith("/") && !lineBeforeCompletion.startsWith("//")
+      const suggestions = slashInput ? slashCommandSuggestions(lineBeforeCompletion, catalog).slice(0, 7) : []
+      const selected = suggestions[paletteSelection]
+      if (selected) {
+        const completed = `/${selected.name}`
+        setImmediate(() => {
+          if (!promptActive || rl.line !== (tabWasInserted ? `${lineBeforeCompletion}\t` : lineBeforeCompletion)) return
+          rl.line = completed
+          rl.cursor = completed.length
+          paletteSelectionLine = completed
+          paletteSelection = 0
+          rl._refreshLine?.()
+        })
+        clearTimeout(paletteRenderTimer)
+        paletteRenderTimer = setTimeout(() => {
+          if (!promptActive) return
+          clearPalette()
+          drawPalette()
+        }, 20)
+        return
+      }
       const completion = rl.cursor === rl.line.length ? slashTabCompletion(lineBeforeCompletion, catalog) : ""
       if (slashInput && (tabWasInserted || completion)) {
         setImmediate(() => {
@@ -1801,7 +1860,10 @@ function promptInterface(jsonMode = false, catalog = { models: [] }) {
       drawPalette()
     }, 20)
   }
-  if (stdin.isTTY && output.isTTY) stdin.on("keypress", onKeypress)
+  if (stdin.isTTY && output.isTTY) {
+    stdin.prependListener("keypress", onPaletteNavigation)
+    stdin.on("keypress", onKeypress)
+  }
   rl.on("SIGINT", () => {
     if (interruptHandler) {
       interruptHandler()
@@ -1856,6 +1918,7 @@ function promptInterface(jsonMode = false, catalog = { models: [] }) {
       interruptHandler = null
       clearTimeout(paletteRenderTimer)
       clearPalette()
+      stdin.removeListener("keypress", onPaletteNavigation)
       stdin.removeListener("keypress", onKeypress)
       rl.close()
     },

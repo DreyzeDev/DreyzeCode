@@ -185,12 +185,13 @@ test("formats the interactive message composer within narrow and wide terminals"
     assert.equal(composer.header.length, width)
     assert.equal(composer.footer.length, width)
     assert.equal(composer.prompt, "│ › ")
-    assert.match(composer.hint, /Enter — отправить/u)
+    assert.match(composer.hint, /Enter —\s*отправить/u)
   }
   const active = formatChatComposer(52, { model: "Dreyze Opus 5.5", mode: "plan", attachments: ["screenshot.png"] })
   const activeText = active.hint.replace(/\n│ ?/gu, " ").replace(/ +│/gu, " ")
-  assert.match(activeText, /Dreyze Opus 5\.5 · Plan/u)
-  assert.match(activeText, /вложения:\s+screenshot\.png/u)
+  assert.match(activeText, /Модель:\s+Dreyze Opus 5\.5/u)
+  assert.match(activeText, /Режим:\s+Plan · только чтение/u)
+  assert.match(activeText, /Изображения:\s+screenshot\.png/u)
 })
 
 test("renders readable session history without internal tool payloads", () => {
@@ -1345,7 +1346,7 @@ test("runs the CLI when invoked through the symlink npm creates for its binary",
   await symlink(cli, command, "file")
   const child = spawnSync(command, ["--version"], { encoding: "utf8" })
   assert.equal(child.status, 0, child.stderr)
-  assert.equal(child.stdout, "DreyzeCode 0.5.19\n")
+  assert.equal(child.stdout, "DreyzeCode 0.5.20\n")
 })
 
 test("help documents image input in both one-shot and interactive modes", async () => {

@@ -63,8 +63,8 @@ Interactive mode has a framed chat composer, separate panels for your messages
 and model replies, and a live status while the model or a local tool is
 working. The composer shows the selected model, mode, and queued image files.
 Slash command suggestions appear as you type, including choices for modes,
-themes, and models. Enter `/` to open the command palette or press Tab to
-complete a command. `/help` lists built-in DreyzeCode commands and personal or
+themes, and models. Use ↑/↓ to move through suggestions and Tab to insert the
+selected command. Enter `/` to open the full command list. `/help` lists built-in DreyzeCode commands and personal or
 project commands. `/review [scope]` inspects the project in read-only Plan mode and
 reports confirmed findings without changing files. `/init` asks the agent to
 create `.dreyze/instructions.md` with project guidance after normal write
