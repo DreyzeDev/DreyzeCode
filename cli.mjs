@@ -1669,10 +1669,12 @@ export async function createSkillScaffold({ name, scope, workspace, userSkillsRo
 
   let skillsRoot
   let scopeLabel
+  let pathRoot
   if (scope === "personal") {
     const configDirectory = resolve(dirname(userSkillsRoot))
     await mkdir(configDirectory, { recursive: true, mode: 0o700 })
     const canonicalContainer = await realpath(configDirectory)
+    pathRoot = canonicalContainer
     const candidateRoot = resolve(userSkillsRoot)
     const rootInfo = await lstat(candidateRoot).catch(() => null)
     if (rootInfo?.isSymbolicLink() || (rootInfo && !rootInfo.isDirectory())) {
@@ -1684,6 +1686,7 @@ export async function createSkillScaffold({ name, scope, workspace, userSkillsRo
   } else {
     if (typeof workspace !== "string" || !workspace) throw new Error("Не удалось определить папку текущего проекта.")
     const canonicalWorkspace = await realpath(workspace)
+    pathRoot = canonicalWorkspace
     const dreyzeDirectory = await ensureDirectoryWithin(canonicalWorkspace, join(canonicalWorkspace, ".dreyze"), 0o755)
     skillsRoot = await ensureDirectoryWithin(canonicalWorkspace, join(dreyzeDirectory, "skills"), 0o755)
     scopeLabel = "."
@@ -1716,7 +1719,8 @@ export async function createSkillScaffold({ name, scope, workspace, userSkillsRo
   } finally {
     await handle.close()
   }
-  const relativeFile = relative(scope === "project" ? await realpath(workspace) : resolve(dirname(userSkillsRoot)), filePath).split(sep).join("/")
+  const canonicalFile = await realpath(filePath)
+  const relativeFile = relative(pathRoot, canonicalFile).split(sep).join("/")
   return {
     name: commandName,
     commandName,
