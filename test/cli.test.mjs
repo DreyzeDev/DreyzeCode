@@ -27,6 +27,7 @@ import {
   runAgentTask,
   slashTabCompletion,
   slashCommandSuggestions,
+  visibleSessionMessages,
   validateImagePaths,
 } from "../cli.mjs"
 import { connectMcpServers, listConfiguredMcpServers } from "../mcp-client.mjs"
@@ -98,6 +99,7 @@ test("shows live slash suggestions for built-in commands and project skills", ()
   assert.deepEqual(slashCommandSuggestions("/пров", catalog), [
     { name: "проверка", usage: "/проверка", description: "Проверить проект." },
   ])
+  assert.deepEqual(slashCommandSuggestions("/his", catalog).map(({ usage }) => usage), ["/history [число]"])
   assert.deepEqual(slashCommandSuggestions("/help later", catalog), [])
   assert.deepEqual(slashCommandSuggestions("//tmp/project", catalog), [])
 })
@@ -131,6 +133,37 @@ test("formats the interactive message composer within narrow and wide terminals"
     assert.equal(composer.prompt, "│ › ")
     assert.match(composer.hint, /Enter — отправить/u)
   }
+})
+
+test("renders readable session history without internal tool payloads", () => {
+  const history = visibleSessionMessages({
+    messages: [
+      { role: "user", content: "Describe this picture.", imagePaths: [path.join("assets", "photo.jpg")] },
+      { role: "assistant", content: JSON.stringify({ type: "tool", name: "read_file", input: { path: "secret.txt" } }) },
+      { role: "user", content: "Tool result (read_file): private tool output" },
+      { role: "assistant", content: JSON.stringify({ type: "plan", content: "I will inspect the image and answer." }) },
+      { role: "user", content: "Дополнительные папки, явно разрешённые для этой сессии: /tmp/shared." },
+      { role: "user", content: "Ответ на уточнение «Which format?»: JPEG" },
+      { role: "assistant", content: "It is a JPEG photo." },
+    ],
+    pendingQuestion: "Should I also crop it?",
+  }, 20)
+  assert.deepEqual(history.map(({ role }) => role), ["user", "assistant", "user", "assistant", "notice"])
+  assert.equal(history[0].attachments[0], "photo.jpg")
+  assert.equal(history[1].content, "I will inspect the image and answer.")
+  assert.equal(history[2].content, "Уточнение: Which format?\nОтвет: JPEG")
+  assert.equal(history.at(-1).content, "Ожидается ответ: Should I also crop it?")
+  assert.doesNotMatch(JSON.stringify(history), /private tool output|secret\.txt|shared/u)
+})
+
+test("limits rendered message size and session history count", () => {
+  const history = visibleSessionMessages({
+    messages: Array.from({ length: 35 }, (_, index) => ({ role: "user", content: `${index}:${"x".repeat(3_000)}` })),
+  }, 100)
+  assert.equal(history.length, 30)
+  assert.match(history[0].content, /^5:/u)
+  assert.ok(history[0].content.length < 2_600)
+  assert.match(history[0].content, /сообщение сокращено/u)
 })
 
 test("wraps long chat output to the available terminal width", () => {
@@ -940,7 +973,7 @@ test("runs the CLI when invoked through the symlink npm creates for its binary",
   await symlink(cli, command, "file")
   const child = spawnSync(command, ["--version"], { encoding: "utf8" })
   assert.equal(child.status, 0, child.stderr)
-  assert.equal(child.stdout, "DreyzeCode 0.5.12\n")
+  assert.equal(child.stdout, "DreyzeCode 0.5.13\n")
 })
 
 test("help documents image input in both one-shot and interactive modes", async () => {

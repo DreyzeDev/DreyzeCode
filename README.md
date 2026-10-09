@@ -63,8 +63,9 @@ is working. Slash command suggestions appear as you type, including choices
 for modes, themes, and models. Enter `/` to open the full command palette or
 press Tab to complete a command. `/help` lists the built-in commands and
 project commands. Use `/skill-name task` to run a project command with a task,
-or `/skills` to list project commands. Prefix a message with `//` when it
-should start with a literal `/`.
+or `/skills` to list project commands. Use `/history [number]` to view recent
+user and assistant messages in the current session; tool payloads stay hidden.
+Prefix a message with `//` when it should start with a literal `/`.
 
 The agent follows project guidance from `AGENTS.md` files and
 `.dreyze/instructions.md`. Nested `AGENTS.md` files are supplied with their

@@ -9,9 +9,12 @@ import { access, chmod, copyFile, lstat, mkdir, open, readdir, readFile, realpat
 import { fileURLToPath } from "node:url"
 import { connectMcpServers, listConfiguredMcpServers } from "./mcp-client.mjs"
 
-export const VERSION = "0.5.12"
+export const VERSION = "0.5.13"
 const MAX_STEPS = 80
 const MAX_HISTORY = 40
+const DEFAULT_HISTORY_DISPLAY_MESSAGES = 8
+const MAX_HISTORY_DISPLAY_MESSAGES = 30
+const MAX_HISTORY_DISPLAY_CHARS = 2_500
 const MAX_MESSAGE_CHARS = 24_000
 const MAX_TOOL_OUTPUT = 12_000
 const MAX_READ_BYTES = 1_000_000
@@ -36,6 +39,7 @@ export const SLASH_COMMANDS = Object.freeze([
   { name: "detach", usage: "/detach", description: "убрать вложения следующего сообщения" },
   { name: "theme", usage: "/theme purple|blue|system", description: "изменить оформление терминала" },
   { name: "status", usage: "/status", description: "показать текущую сессию и проект" },
+  { name: "history", usage: "/history [число]", description: "показать последние сообщения чата" },
   { name: "sessions", usage: "/sessions", description: "показать последние сессии проекта" },
   { name: "resume", usage: "/resume [ID]", description: "открыть сессию по ID или последнюю" },
   { name: "new", usage: "/new", description: "начать новую сессию" },
@@ -392,8 +396,8 @@ function printHelp() {
     `Параметры: --model ID, --mode build|plan, --add-dir PATH, --image PATH (повторяемый), --session ID, --json, --yes\n` +
     `В Build изменения файлов и команды требуют подтверждения. Plan разрешает только чтение.\n` +
     `В интерактивном режиме: подсказки появляются при вводе /; Enter / открывает полный список.\n` +
-    `Tab дополняет команды, skills, режимы, темы и модели.\n` +
-    `Команды: /help, /skills, /mode, /model, /attach, /detach, /theme, /status, /sessions, /resume, /new, /clear, /exit.\n` +
+    `Tab дополняет команды проекта, режимы, темы и модели.\n` +
+    `Команды: /help, /skills, /mode, /model, /attach, /detach, /theme, /status, /history, /sessions, /resume, /new, /clear, /exit.\n` +
     `Проектный skill запускается как /<имя-папки> задача.\n`)
 }
 
@@ -610,6 +614,49 @@ function appendMessage(session, role, content, imagePaths = []) {
     const [removed] = session.messages.splice(1, 1)
     total -= removed.content.length
   }
+}
+
+export function visibleSessionMessages(session, requestedLimit = DEFAULT_HISTORY_DISPLAY_MESSAGES) {
+  const limit = Number.isInteger(requestedLimit)
+    ? Math.max(1, Math.min(MAX_HISTORY_DISPLAY_MESSAGES, requestedLimit))
+    : DEFAULT_HISTORY_DISPLAY_MESSAGES
+  const messages = Array.isArray(session?.messages) ? session.messages : []
+  const visible = []
+  for (const message of messages) {
+    if (!message || !["user", "assistant"].includes(message.role) || typeof message.content !== "string") continue
+    if (message.role === "user") {
+      if (message.content.startsWith("Дополнительные папки, явно разрешённые для этой сессии:")) continue
+      if (/^Tool result \(/u.test(message.content)) continue
+      const recovery = /^Recovery notice: the previous CLI process stopped during ([^.]+)\./u.exec(message.content)
+      if (recovery) {
+        visible.push({ role: "notice", content: `Процесс остановился во время действия «${recovery[1]}». Результат неизвестен; перед повтором проверьте проект.` })
+        continue
+      }
+      const clarification = /^Ответ на уточнение «([\s\S]*?)»: ([\s\S]*)$/u.exec(message.content)
+      const content = clarification
+        ? `Уточнение: ${clarification[1]}\nОтвет: ${clarification[2]}`
+        : message.content
+      visible.push({
+        role: "user",
+        content: content.length > MAX_HISTORY_DISPLAY_CHARS ? `${content.slice(0, MAX_HISTORY_DISPLAY_CHARS)}\n… сообщение сокращено` : content,
+        attachments: Array.isArray(message.imagePaths) ? message.imagePaths.filter((path) => typeof path === "string").map((path) => basename(path)).slice(0, MAX_IMAGES_PER_MESSAGE) : [],
+      })
+      continue
+    }
+    let content = message.content
+    try {
+      const action = JSON.parse(message.content)
+      if (action?.type === "tool") continue
+      if (action?.type === "plan" && typeof action.content === "string") content = action.content
+      else if (action?.type === "final" && typeof action.content === "string") content = action.content
+    } catch {}
+    if (content.length > MAX_HISTORY_DISPLAY_CHARS) content = `${content.slice(0, MAX_HISTORY_DISPLAY_CHARS)}\n… сообщение сокращено`
+    visible.push({ role: "assistant", content })
+  }
+  if (typeof session?.pendingQuestion === "string" && session.pendingQuestion) {
+    visible.push({ role: "notice", content: `Ожидается ответ: ${session.pendingQuestion}` })
+  }
+  return visible.slice(-limit)
 }
 
 export async function recoverPendingAction(session, store) {
@@ -1621,8 +1668,22 @@ async function interactive(options, config, catalog, initialSession, store, root
     const rows = catalog.models.map((model) => `${model.id === session.model ? "●" : "○"} ${model.name} · ${model.id}${model.supportsImages ? " · images" : ""}`)
     writeChatMessage("Модели Dreyze", rows.join("\n") || "Каталог моделей пуст.", color)
   }
+  const printSessionHistory = (limit = DEFAULT_HISTORY_DISPLAY_MESSAGES) => {
+    const messages = visibleSessionMessages(session, limit)
+    writeChatMessage("История чата", messages.length ? `Последние ${messages.length} сообщений · служебные вызовы инструментов скрыты.` : "В этой сессии пока нет сообщений.", color)
+    for (const message of messages) {
+      const title = message.role === "user"
+        ? "Вы"
+        : message.role === "notice"
+          ? "Состояние сессии"
+          : `DreyzeCode · ${session.model}`
+      const attachments = message.attachments?.length ? `\n\nВложения: ${message.attachments.join(", ")}` : ""
+      writeChatMessage(title, `${message.content}${attachments}`, color)
+    }
+  }
   printSessionHeader()
   const recovered = await recoverPendingAction(session, store)
+  if (session.messages.length || session.pendingQuestion) printSessionHistory()
   const resumed = await resumeInteractiveSession({
     options,
     config,
@@ -1738,6 +1799,12 @@ async function interactive(options, config, catalog, initialSession, store, root
         writeChatMessage("Состояние сессии", `ID: ${session.id}\nМодель: ${session.model}\nРежим: ${session.mode}\nПроект: ${workspace}\nВложения: ${attachments}`, color)
         continue
       }
+      if (name === "history") {
+        const requested = value ? Number(value) : DEFAULT_HISTORY_DISPLAY_MESSAGES
+        if (!Number.isInteger(requested) || requested < 1) writeChatMessage("История чата", "Использование: /history [число от 1 до 30].", color)
+        else printSessionHistory(Math.min(requested, MAX_HISTORY_DISPLAY_MESSAGES))
+        continue
+      }
       if (name === "sessions") {
         const sessions = await store.list(10)
         if (!sessions.some((item) => item.id === session.id)) {
@@ -1752,6 +1819,8 @@ async function interactive(options, config, catalog, initialSession, store, root
           session = value ? await store.load(value) : await store.latest()
           pendingImagePaths = []
           writeChatMessage("Сессия открыта", `${session.id}\n${session.model} · ${session.mode}`, color)
+          printSessionHeader()
+          printSessionHistory()
         } catch {
           writeChatMessage("Сессия не найдена", value ? `Не удалось открыть ${value}.` : "В этом проекте ещё нет сохранённых сессий.", color)
         }
@@ -1762,6 +1831,7 @@ async function interactive(options, config, catalog, initialSession, store, root
         pendingImagePaths = []
         await store.save(session)
         writeChatMessage("Новая сессия", `${session.id}\n${session.model} · ${session.mode}`, color)
+        printSessionHeader()
         continue
       }
       if (name === "clear") {
