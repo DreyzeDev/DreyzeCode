@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import { access, mkdtemp, mkdir, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises"
+import { access, mkdtemp, mkdir, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { spawnSync } from "node:child_process"
@@ -15,6 +15,7 @@ import {
   apiGet,
   buildSkillPrompt,
   completeSlashInput,
+  createSkillScaffold,
   executeTool,
   fetchModelCatalog,
   formatChatMessage,
@@ -685,6 +686,69 @@ test("discovers personal slash skills without adding the personal directory to p
   assert.match(prompt, /Review this project/u)
 })
 
+test("creates personal and project slash skill templates without overwriting files", async (t) => {
+  const { workspace, config } = await fixture(t)
+  const userSkillsRoot = path.join(config, "dreyze-code", "skills")
+  const personal = await createSkillScaffold({ name: "my-review", scope: "personal", workspace, userSkillsRoot })
+  assert.deepEqual(personal, {
+    name: "my-review",
+    commandName: "my-review",
+    path: "@user/skills/my-review/SKILL.md",
+    description: "Опишите, когда использовать эту команду.",
+  })
+  const personalBody = await readFile(path.join(userSkillsRoot, "my-review", "SKILL.md"), "utf8")
+  assert.match(personalBody, /^---\nname: my-review\n/u)
+  assert.match(personalBody, /## Инструкции/u)
+  if (process.platform !== "win32") assert.equal((await stat(path.join(userSkillsRoot, "my-review", "SKILL.md"))).mode & 0o777, 0o600)
+  assert.equal((await loadUserSkills({ userSkillsRoot }))[0].commandName, "my-review")
+  await assert.rejects(
+    createSkillScaffold({ name: "my-review", scope: "personal", workspace, userSkillsRoot }),
+    /уже существует/u,
+  )
+
+  const project = await createSkillScaffold({ name: "проверка", scope: "project", workspace, userSkillsRoot })
+  assert.equal(project.path, "./.dreyze/skills/проверка/SKILL.md")
+  assert.equal((await loadProjectSkills([workspace]))[0].commandName, "проверка")
+  if (process.platform !== "win32") {
+    const projectMode = (await stat(path.join(workspace, ".dreyze", "skills", "проверка", "SKILL.md"))).mode & 0o777
+    assert.equal(projectMode & 0o600, 0o600)
+    assert.equal(projectMode & 0o022, 0)
+  }
+})
+
+test("refuses invalid or built-in slash skill names", async (t) => {
+  const { workspace, config } = await fixture(t)
+  const userSkillsRoot = path.join(config, "dreyze-code", "skills")
+  await assert.rejects(
+    createSkillScaffold({ name: "../escape", scope: "personal", workspace, userSkillsRoot }),
+    /Имя skill/u,
+  )
+  await assert.rejects(
+    createSkillScaffold({ name: "review", scope: "personal", workspace, userSkillsRoot }),
+    /уже используется встроенной командой/u,
+  )
+})
+
+test("refuses to create a project skill through a linked configuration folder", async (t) => {
+  const { root, workspace, config } = await fixture(t)
+  const outside = path.join(root, "outside-dreyze")
+  await mkdir(outside)
+  try {
+    await symlink(outside, path.join(workspace, ".dreyze"), process.platform === "win32" ? "junction" : "dir")
+  } catch (error) {
+    if (process.platform === "win32" && ["EPERM", "EACCES", "ENOTSUP"].includes(error?.code)) {
+      t.skip("Windows runner does not permit creating symlinks")
+      return
+    }
+    throw error
+  }
+  await assert.rejects(
+    createSkillScaffold({ name: "safe-command", scope: "project", workspace, userSkillsRoot: path.join(config, "skills") }),
+    /символическую ссылку/u,
+  )
+  assert.deepEqual(await readdir(outside), [])
+})
+
 test("project slash skills take precedence over same-named personal skills", async (t) => {
   const { workspace, config } = await fixture(t)
   const projectSkill = path.join(workspace, ".dreyze", "skills", "release")
@@ -783,6 +847,29 @@ test("lists personal slash skills without requiring a Dreyze login", async (t) =
     path: "@user/skills/my-review/SKILL.md",
     description: "My personal checklist.",
   }])
+})
+
+test("creates a personal slash command from the CLI without a login", async (t) => {
+  const { workspace, config } = await fixture(t)
+  const cli = fileURLToPath(new URL("../cli.mjs", import.meta.url))
+  const env = process.platform === "win32"
+    ? { ...process.env, APPDATA: config }
+    : { ...process.env, XDG_CONFIG_HOME: config }
+  const child = spawnSync(process.execPath, [cli, "--json", "skills", "create", "personal", "my-command"], {
+    cwd: workspace,
+    env,
+    encoding: "utf8",
+  })
+  assert.equal(child.status, 0, child.stderr)
+  assert.deepEqual(JSON.parse(child.stdout), {
+    ok: true,
+    skill: {
+      name: "my-command",
+      commandName: "my-command",
+      path: "@user/skills/my-command/SKILL.md",
+      description: "Опишите, когда использовать эту команду.",
+    },
+  })
 })
 
 test("rejects traversal, symlink escapes, and sensitive reads", async (t) => {
@@ -1258,7 +1345,7 @@ test("runs the CLI when invoked through the symlink npm creates for its binary",
   await symlink(cli, command, "file")
   const child = spawnSync(command, ["--version"], { encoding: "utf8" })
   assert.equal(child.status, 0, child.stderr)
-  assert.equal(child.stdout, "DreyzeCode 0.5.18\n")
+  assert.equal(child.stdout, "DreyzeCode 0.5.19\n")
 })
 
 test("help documents image input in both one-shot and interactive modes", async () => {

@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url"
 import { connectMcpServers, listConfiguredMcpServers } from "./mcp-client.mjs"
 import { describeHooks, loadConfiguredHooks, runHookEvent } from "./hooks.mjs"
 
-export const VERSION = "0.5.18"
+export const VERSION = "0.5.19"
 const MAX_STEPS = 80
 const MAX_HISTORY = 40
 const DEFAULT_HISTORY_DISPLAY_MESSAGES = 8
@@ -487,6 +487,8 @@ function printHelp() {
     `  dreyzecode sessions list               найти локальные сессии проекта\n` +
     `  dreyzecode sessions show <id>          вывести локальную сессию\n` +
     `  dreyzecode skills list                 показать личные и проектные skills\n` +
+    `  dreyzecode skills create personal <имя> создать личную slash-команду\n` +
+    `  dreyzecode skills create project <имя>  создать команду в проекте\n` +
     `  dreyzecode hooks list                  показать hooks проекта и пользователя\n` +
     `  dreyzecode mcp list                    показать настроенные MCP серверы\n` +
     `  dreyzecode api get /api/...            безопасный GET к API Dreyze\n\n` +
@@ -1644,6 +1646,85 @@ export async function loadAvailableSkills(roots, options = {}) {
   return [...projectSkills, ...userSkills]
 }
 
+async function ensureDirectoryWithin(root, pathname, mode = 0o700) {
+  try {
+    await mkdir(pathname, { mode })
+  } catch (error) {
+    if (error?.code !== "EEXIST") throw error
+  }
+  const info = await lstat(pathname)
+  if (!info.isDirectory() || info.isSymbolicLink()) throw new Error("Каталог skill проходит через символическую ссылку или не является папкой.")
+  const canonical = await realpath(pathname)
+  if (!within(root, canonical)) throw new Error("Каталог skill находится вне разрешённой папки.")
+  return canonical
+}
+
+export async function createSkillScaffold({ name, scope, workspace, userSkillsRoot = join(configRoot, "skills") } = {}) {
+  const commandName = typeof name === "string" ? name.normalize("NFC").toLowerCase() : ""
+  if (!/^\p{L}[\p{L}\p{N}-]{0,79}$/u.test(commandName)) {
+    throw new Error("Имя skill должно начинаться с буквы и содержать только буквы, цифры и дефисы.")
+  }
+  if (SLASH_COMMAND_NAMES.has(commandName)) throw new Error(`Имя /${commandName} уже используется встроенной командой.`)
+  if (scope !== "personal" && scope !== "project") throw new Error("Укажите область skill: personal или project.")
+
+  let skillsRoot
+  let scopeLabel
+  if (scope === "personal") {
+    const configDirectory = resolve(dirname(userSkillsRoot))
+    await mkdir(configDirectory, { recursive: true, mode: 0o700 })
+    const canonicalContainer = await realpath(configDirectory)
+    const candidateRoot = resolve(userSkillsRoot)
+    const rootInfo = await lstat(candidateRoot).catch(() => null)
+    if (rootInfo?.isSymbolicLink() || (rootInfo && !rootInfo.isDirectory())) {
+      throw new Error("Личный каталог skills должен быть обычной папкой, а не символической ссылкой.")
+    }
+    skillsRoot = rootInfo ? await realpath(candidateRoot) : await ensureDirectoryWithin(canonicalContainer, candidateRoot)
+    if (!within(canonicalContainer, skillsRoot)) throw new Error("Личный каталог skills находится вне конфигурации DreyzeCode.")
+    scopeLabel = "@user"
+  } else {
+    if (typeof workspace !== "string" || !workspace) throw new Error("Не удалось определить папку текущего проекта.")
+    const canonicalWorkspace = await realpath(workspace)
+    const dreyzeDirectory = await ensureDirectoryWithin(canonicalWorkspace, join(canonicalWorkspace, ".dreyze"), 0o755)
+    skillsRoot = await ensureDirectoryWithin(canonicalWorkspace, join(dreyzeDirectory, "skills"), 0o755)
+    scopeLabel = "."
+  }
+
+  const targetDirectory = join(skillsRoot, commandName)
+  try {
+    await mkdir(targetDirectory, { mode: scope === "personal" ? 0o700 : 0o755 })
+  } catch (error) {
+    if (error?.code === "EEXIST") throw new Error(`Skill /${commandName} уже существует.`)
+    throw error
+  }
+  const canonicalDirectory = await realpath(targetDirectory)
+  if (!within(skillsRoot, canonicalDirectory)) throw new Error("Каталог нового skill оказался вне разрешённой папки.")
+  const filePath = join(canonicalDirectory, "SKILL.md")
+  const handle = await open(filePath, "wx", scope === "personal" ? 0o600 : 0o644)
+  try {
+    await handle.writeFile([
+      "---",
+      `name: ${commandName}`,
+      "description: Опишите, когда использовать эту команду.",
+      "---",
+      "",
+      "## Инструкции",
+      "Опишите здесь шаги и правила, которые нужно применять каждый раз.",
+      "",
+      "Запрос пользователя будет добавлен ниже этих инструкций.",
+      "",
+    ].join("\n"), "utf8")
+  } finally {
+    await handle.close()
+  }
+  const relativeFile = relative(scope === "project" ? await realpath(workspace) : resolve(dirname(userSkillsRoot)), filePath).split(sep).join("/")
+  return {
+    name: commandName,
+    commandName,
+    path: `${scopeLabel}/${relativeFile}`,
+    description: "Опишите, когда использовать эту команду.",
+  }
+}
+
 function promptInterface(jsonMode = false, catalog = { models: [] }) {
   const output = jsonMode ? stderr : stdout
   const rl = createInterface({
@@ -2276,7 +2357,20 @@ export async function runCli(args = process.argv.slice(2)) {
   }
   if (options.command === "skills") {
     const subcommand = options.positionals[0]
-    if (subcommand && subcommand !== "list") throw new Error("Использование: dreyzecode skills list")
+    if (subcommand === "create") {
+      if (options.positionals.length !== 3) {
+        throw new Error("Использование: dreyzecode skills create personal|project <имя>")
+      }
+      const skill = await createSkillScaffold({
+        scope: options.positionals[1],
+        name: options.positionals[2],
+        workspace,
+      })
+      if (options.json) jsonOut({ ok: true, skill })
+      else stdout.write(`Создан skill /${skill.commandName}: ${skill.path}\nОтредактируйте SKILL.md, затем вызовите команду через /${skill.commandName}.\n`)
+      return
+    }
+    if (subcommand && subcommand !== "list") throw new Error("Использование: dreyzecode skills list|create personal|project <имя>")
     const skills = await loadAvailableSkills(await canonicalRoots(workspace, options.addDirs))
     if (options.json) jsonOut({ ok: true, skills })
     else if (!skills.length) stdout.write("Личные и проектные skills не найдены.\n")

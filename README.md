@@ -26,6 +26,8 @@ for the account password in the terminal.
 dreyzecode --json doctor
 dreyzecode models list
 dreyzecode skills list
+dreyzecode skills create personal my-review
+dreyzecode skills create project release-check
 dreyzecode mcp list
 dreyzecode run "Inspect the project and fix the failing check"
 dreyzecode run "Describe the UI and suggest improvements" --image ./screenshot.png
@@ -95,10 +97,13 @@ directory. Personal skills work in every project and live at
 `~/.config/dreyze-code/skills/<name>/SKILL.md` on Linux and macOS, or
 `%APPDATA%\DreyzeCode\skills\<name>\SKILL.md` on Windows. When
 `XDG_CONFIG_HOME` is set, Linux and macOS use
-`$XDG_CONFIG_HOME/dreyze-code/skills/`. A project skill with the same command
-name takes precedence while you are in that project. Personal skill folders
-are never added to the agent's project filesystem roots; DreyzeCode reads the
-selected instruction file locally when you invoke its slash command.
+`$XDG_CONFIG_HOME/dreyze-code/skills/`. Create a personal command with
+`dreyzecode skills create personal <name>` or a project command with
+`dreyzecode skills create project <name>`. The CLI writes a starter `SKILL.md`
+and refuses to overwrite an existing command. A project skill with the same
+command name takes precedence while you are in that project. Personal skill
+folders are never added to the agent's project filesystem roots; DreyzeCode
+reads the selected instruction file locally when you invoke its slash command.
 
 Local lifecycle hooks can be listed with `/hooks` or `dreyzecode hooks list`.
 Project hooks live in `.dreyze/hooks.json`; user-wide hooks live in
