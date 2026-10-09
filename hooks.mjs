@@ -18,6 +18,12 @@ function within(root, candidate) {
   return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel))
 }
 
+function normalizeRealPath(pathname) {
+  if (platform !== "win32") return pathname
+  if (pathname.startsWith("\\\\?\\UNC\\")) return `\\\\${pathname.slice(8)}`
+  return pathname.startsWith("\\\\?\\") ? pathname.slice(4) : pathname
+}
+
 function isRecord(value) {
   return Boolean(value && typeof value === "object" && !Array.isArray(value))
 }
@@ -39,8 +45,9 @@ async function readHookFile(pathname, { scope, root }) {
   }
   let content
   try {
-    const canonical = await realpath(pathname)
-    if (root && !within(root, canonical)) return { hooks: [], issues: [`Файл hooks (${scope}) выходит за разрешённую папку.`] }
+    const canonical = normalizeRealPath(await realpath(pathname))
+    const safeRoot = root ? normalizeRealPath(root) : null
+    if (safeRoot && !within(safeRoot, canonical)) return { hooks: [], issues: [`Файл hooks (${scope}) выходит за разрешённую папку.`] }
     content = await readFile(canonical, "utf8")
   } catch {
     return { hooks: [], issues: [`Не удалось прочитать файл hooks (${scope}).`] }
