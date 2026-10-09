@@ -168,7 +168,7 @@ export async function executeHookCommand(hook, payload, { signal, redact } = {})
   if (signal?.aborted) throw signal.reason ?? new DOMException("Hook cancelled.", "AbortError")
   const shell = platform === "win32" ? "powershell.exe" : "/bin/sh"
   const args = platform === "win32"
-    ? ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", hook.command]
+    ? ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", `${hook.command}; if ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE }`]
     : ["-lc", hook.command]
   const childEnv = { ...env }
   for (const key of Object.keys(childEnv)) {
