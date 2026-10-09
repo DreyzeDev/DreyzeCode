@@ -41,6 +41,8 @@ dreyzecode sessions list
 dreyzecode agents start "Review the image upload flow"
 dreyzecode agents list
 dreyzecode agents attach <agent-id>
+dreyzecode agents approve <agent-id>
+dreyzecode agents answer <agent-id> "Use the current brand colors"
 ```
 
 Build mode can read and search project files. It asks before changing files,
@@ -86,14 +88,15 @@ the session is saved so you can continue with `dreyzecode --continue`. If a
 write or command had already started, its outcome is marked unknown and the
 agent inspects the project before retrying it.
 
-Background research agents run in a separate saved session and leave the
-current chat and its resume pointer unchanged. Start one with
-`dreyzecode agents start "task"` or `/agents start task`; check it with
-`agents list` or `/agents show ID`, wait for the result with `agents attach ID`,
-and request cancellation with `agents stop ID`. These background tasks always
-use read-only Plan mode: they can inspect project files and search the web, but
-cannot write files, run commands, or invoke MCP tools. The original chat remains
-available while research runs.
+Background agents run in a separate saved session and leave the current chat
+and its resume pointer unchanged. Start one with `dreyzecode agents start
+"task"` or `/agents start task`; the default is Build mode. File changes,
+commands, hooks, and MCP calls wait for your approval. Use `agents show ID` to
+inspect a pending action, then `agents approve ID` or `agents deny ID`; answer
+agent questions with `agents answer ID "your answer"`. Use `agents attach ID` to
+wait for the next result or approval request, and `agents stop ID` to cancel.
+Choose `--mode plan` or `/agents start --mode plan task` for read-only research.
+The original chat remains available while the agent works.
 
 The agent follows project guidance from `AGENTS.md` files and
 `.dreyze/instructions.md`. Nested `AGENTS.md` files are supplied with their
@@ -212,7 +215,7 @@ characters. Use `--yes` when running unattended tasks that need approval.
 ## Current command contract
 
 - `login`, `logout`, `doctor`, `models list`, `sessions list`, `sessions show`
-- `agents list|start|show|attach|stop` and the matching `/agents` chat command
+- `agents list|start|show|attach|approve|deny|answer|stop` and the matching `/agents` chat command
 - `skills list` for personal and project-local capabilities
 - `mcp list` for configured local and remote MCP servers
 - Interactive chat, `run`, `--continue`, `--session`, `--model`, and `--mode`

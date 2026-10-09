@@ -214,7 +214,7 @@ test("runs a background research task in its own read-only session without chang
     child.once("close", (code) => resolvePromise({ code, stdout: stdoutText, stderr: stderrText }))
   })
 
-  const started = await invoke(["agents", "start", "Inspect the project safely", "--json"])
+  const started = await invoke(["agents", "start", "Inspect the project safely", "--mode", "plan", "--json"])
   assert.equal(started.code, 0, started.stderr)
   const startResult = JSON.parse(started.stdout)
   assert.equal(startResult.ok, true)
@@ -233,6 +233,165 @@ test("runs a background research task in its own read-only session without chang
   assert.equal(requestBody.model, "dreyze/test")
   assert.match(requestBody.messages.at(-1).content, /Inspect the project safely/u)
   assert.equal((await store.latest()).id, active.id)
+})
+
+test("background Build agents wait for a direct approval before modifying the project", { timeout: 15_000 }, async (t) => {
+  const { config, workspace } = await fixture(t)
+  const cookie = `__Host-dreyzeai_session=${"c".repeat(64)}`
+  const requests = []
+  const server = createServer(async (request, response) => {
+    let body = ""
+    for await (const chunk of request) body += chunk
+    if (request.url === "/api/code/v1/models") {
+      response.writeHead(200, { "content-type": "application/json" })
+      response.end(JSON.stringify({ defaultModel: "dreyze/test", data: [{ id: "dreyze/test", name: "Test", group: "test" }] }))
+      return
+    }
+    if (request.url === "/api/code/agent/turn") {
+      const turn = JSON.parse(body)
+      requests.push(turn)
+      response.writeHead(200, { "content-type": "application/json" })
+      const toolResults = turn.messages.filter((message) => message.content.startsWith("Tool result (write_file):"))
+      const lastToolResult = toolResults.at(-1)?.content || ""
+      response.end(JSON.stringify(lastToolResult.includes("Файл создан")
+        ? { type: "final", content: "Файл создан после подтверждения." }
+        : { type: "tool", name: "write_file", input: lastToolResult.includes("отклонено")
+          ? { path: "approved.txt", content: "confirmed content" }
+          : { path: "denied.txt", content: "must stay absent" } }))
+      return
+    }
+    response.writeHead(404).end("{}")
+  })
+  await new Promise((resolvePromise) => server.listen(0, "127.0.0.1", resolvePromise))
+  t.after(() => new Promise((resolvePromise) => server.close(resolvePromise)))
+  const address = server.address()
+  const configData = JSON.stringify({ url: `http://127.0.0.1:${address.port}`, cookie })
+  for (const folder of [path.join(config, "dreyze-code"), path.join(config, "DreyzeCode")]) {
+    await mkdir(folder, { recursive: true })
+    await writeFile(path.join(folder, "config.json"), configData, { mode: 0o600 })
+  }
+  const sessionRoot = process.platform === "win32" ? path.join(config, "DreyzeCode") : path.join(config, "dreyze-code")
+  const store = createSessionStore(workspace, sessionRoot)
+  const active = await store.create("dreyze/test", "build")
+  await store.save(active)
+  const cli = fileURLToPath(new URL("../cli.mjs", import.meta.url))
+  const environment = { ...process.env, XDG_CONFIG_HOME: config, APPDATA: config }
+  const invoke = (args) => new Promise((resolvePromise, rejectPromise) => {
+    const child = spawn(process.execPath, [cli, ...args], { cwd: workspace, env: environment, stdio: ["ignore", "pipe", "pipe"] })
+    let stdoutText = ""
+    let stderrText = ""
+    child.stdout.setEncoding("utf8").on("data", (chunk) => { stdoutText += chunk })
+    child.stderr.setEncoding("utf8").on("data", (chunk) => { stderrText += chunk })
+    child.once("error", rejectPromise)
+    child.once("close", (code) => resolvePromise({ code, stdout: stdoutText, stderr: stderrText }))
+  })
+
+  const started = await invoke(["agents", "start", "Create approved.txt", "--mode", "build", "--json"])
+  assert.equal(started.code, 0, started.stderr)
+  const id = JSON.parse(started.stdout).agent.id
+  t.after(() => invoke(["agents", "stop", id]).catch(() => {}))
+  let pending
+  for (let attempt = 0; attempt < 60; attempt++) {
+    const shown = await invoke(["agents", "show", id, "--json"])
+    assert.equal(shown.code, 0, shown.stderr)
+    pending = JSON.parse(shown.stdout).agent
+    if (pending.status === "awaiting_approval") break
+    if (["failed", "interrupted", "completed"].includes(pending.status)) break
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 100))
+  }
+  assert.equal(pending.status, "awaiting_approval", pending.error || "Agent did not request approval.")
+  assert.match(pending.approval.prompt, /denied\.txt/u)
+  const denial = await invoke(["agents", "deny", id, "--json"])
+  assert.equal(denial.code, 0, denial.stderr)
+  assert.equal(JSON.parse(denial.stdout).decision, "denied")
+  await assert.rejects(access(path.join(workspace, "denied.txt")), { code: "ENOENT" })
+  for (let attempt = 0; attempt < 60; attempt++) {
+    const shown = await invoke(["agents", "show", id, "--json"])
+    assert.equal(shown.code, 0, shown.stderr)
+    pending = JSON.parse(shown.stdout).agent
+    if (pending.status === "awaiting_approval") break
+    if (["failed", "interrupted", "completed"].includes(pending.status)) break
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 100))
+  }
+  assert.equal(pending.status, "awaiting_approval", pending.error || "Agent did not ask for a second approval after denial.")
+  assert.match(pending.approval.prompt, /approved\.txt/u)
+  await assert.rejects(access(path.join(workspace, "approved.txt")), { code: "ENOENT" })
+  const approval = await invoke(["agents", "approve", id, "--json"])
+  assert.equal(approval.code, 0, approval.stderr)
+  assert.equal(JSON.parse(approval.stdout).decision, "approved")
+  const attached = await invoke(["agents", "attach", id, "--json"])
+  assert.equal(attached.code, 0, attached.stderr)
+  assert.equal(JSON.parse(attached.stdout).agent.status, "completed")
+  assert.equal(await readFile(path.join(workspace, "approved.txt"), "utf8"), "confirmed content")
+  assert.ok(requests.every((turn) => turn.mode === "build"))
+  assert.equal((await store.latest()).id, active.id)
+})
+
+test("background agents can pause for a question and resume with the user's answer", { timeout: 15_000 }, async (t) => {
+  const { config, workspace } = await fixture(t)
+  const cookie = `__Host-dreyzeai_session=${"d".repeat(64)}`
+  const turns = []
+  const server = createServer(async (request, response) => {
+    let body = ""
+    for await (const chunk of request) body += chunk
+    if (request.url === "/api/code/v1/models") {
+      response.writeHead(200, { "content-type": "application/json" })
+      response.end(JSON.stringify({ defaultModel: "dreyze/test", data: [{ id: "dreyze/test", name: "Test", group: "test" }] }))
+      return
+    }
+    if (request.url === "/api/code/agent/turn") {
+      const turn = JSON.parse(body)
+      turns.push(turn)
+      const answered = turn.messages.some((message) => message.content.includes("Ответ на уточнение «Какой цвет сайта?»"))
+      response.writeHead(200, { "content-type": "application/json" })
+      response.end(JSON.stringify(answered
+        ? { type: "final", content: "Продолжил с выбранным цветом." }
+        : { type: "tool", name: "ask_user", input: { question: "Какой цвет сайта?" } }))
+      return
+    }
+    response.writeHead(404).end("{}")
+  })
+  await new Promise((resolvePromise) => server.listen(0, "127.0.0.1", resolvePromise))
+  t.after(() => new Promise((resolvePromise) => server.close(resolvePromise)))
+  const address = server.address()
+  const configData = JSON.stringify({ url: `http://127.0.0.1:${address.port}`, cookie })
+  for (const folder of [path.join(config, "dreyze-code"), path.join(config, "DreyzeCode")]) {
+    await mkdir(folder, { recursive: true })
+    await writeFile(path.join(folder, "config.json"), configData, { mode: 0o600 })
+  }
+  const cli = fileURLToPath(new URL("../cli.mjs", import.meta.url))
+  const environment = { ...process.env, XDG_CONFIG_HOME: config, APPDATA: config }
+  const invoke = (args) => new Promise((resolvePromise, rejectPromise) => {
+    const child = spawn(process.execPath, [cli, ...args], { cwd: workspace, env: environment, stdio: ["ignore", "pipe", "pipe"] })
+    let stdoutText = ""
+    let stderrText = ""
+    child.stdout.setEncoding("utf8").on("data", (chunk) => { stdoutText += chunk })
+    child.stderr.setEncoding("utf8").on("data", (chunk) => { stderrText += chunk })
+    child.once("error", rejectPromise)
+    child.once("close", (code) => resolvePromise({ code, stdout: stdoutText, stderr: stderrText }))
+  })
+
+  const started = await invoke(["agents", "start", "Build a site", "--json"])
+  assert.equal(started.code, 0, started.stderr)
+  const id = JSON.parse(started.stdout).agent.id
+  t.after(() => invoke(["agents", "stop", id]).catch(() => {}))
+  let pending
+  for (let attempt = 0; attempt < 60; attempt++) {
+    const shown = await invoke(["agents", "show", id, "--json"])
+    assert.equal(shown.code, 0, shown.stderr)
+    pending = JSON.parse(shown.stdout).agent
+    if (pending.status === "needs_input") break
+    if (["failed", "interrupted", "completed"].includes(pending.status)) break
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 100))
+  }
+  assert.equal(pending.status, "needs_input", pending.error || "Agent did not save its question.")
+  assert.equal(pending.question, "Какой цвет сайта?")
+  const resumed = await invoke(["agents", "answer", id, "синий", "--json"])
+  assert.equal(resumed.code, 0, resumed.stderr)
+  const attached = await invoke(["agents", "attach", id, "--json"])
+  assert.equal(attached.code, 0, attached.stderr)
+  assert.equal(JSON.parse(attached.stdout).agent.status, "completed")
+  assert.ok(turns.at(-1).messages.some((message) => message.content.includes("синий")))
 })
 
 test("cancels a background agent and keeps its state out of the latest-session pointer", { timeout: 5_000 }, async (t) => {
@@ -1193,6 +1352,19 @@ test("shows a safe, bounded preview before asking to write a file", async (t) =>
   assert.doesNotMatch(prompt, /\u001b/u)
   assert.match(result.output, /отклонено/u)
   await assert.rejects(readFile(path.join(workspace, "new.txt"), "utf8"), { code: "ENOENT" })
+
+  let commandPrompt = ""
+  const commandResult = await executeTool({
+    name: "run_command",
+    input: { command: `echo safe\u001b[2Jhidden ghp_${"x".repeat(30)}` },
+  }, {
+    workspace,
+    roots: [workspace],
+    question: async (value) => { commandPrompt = value; return "n" },
+  })
+  assert.match(commandPrompt, /ANSI control omitted/u)
+  assert.doesNotMatch(commandPrompt, /\u001b|ghp_x{30}/u)
+  assert.match(commandResult.output, /отклонено/u)
 })
 
 test("renames a project folder and refuses to move a folder into itself", async (t) => {
@@ -1612,7 +1784,7 @@ test("runs the CLI when invoked through the symlink npm creates for its binary",
   await symlink(cli, command, "file")
   const child = spawnSync(command, ["--version"], { encoding: "utf8" })
   assert.equal(child.status, 0, child.stderr)
-  assert.equal(child.stdout, "DreyzeCode 0.5.24\n")
+  assert.equal(child.stdout, "DreyzeCode 0.5.25\n")
 })
 
 test("help documents image input in both one-shot and interactive modes", async () => {
