@@ -14,7 +14,7 @@ import { describeHooks, loadConfiguredHooks, runHookEvent } from "./hooks.mjs"
 export const VERSION = "0.5.29"
 const MAX_STEPS = 80
 const MAX_HISTORY = 40
-const MAX_COMPACTED_HISTORY = MAX_HISTORY * 2
+const MAX_COMPACTED_HISTORY = MAX_HISTORY
 const MAX_CHECKPOINTS = 100
 const MAX_CHECKPOINT_CHANGES = MAX_STEPS * 2
 const MAX_CHECKPOINT_BLOB_BYTES = 20_000_000
