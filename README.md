@@ -31,6 +31,7 @@ dreyzecode skills create project release-check
 dreyzecode mcp list
 dreyzecode run "Inspect the project and fix the failing check"
 dreyzecode run "Inspect the project" --output-format stream-json
+git diff | dreyzecode run "Review these changes" --stdin --mode plan
 dreyzecode run "Describe the UI and suggest improvements" --image ./screenshot.png
 dreyzecode --continue
 dreyzecode --model dreyze/model-id --mode plan run "Review the authentication flow"
@@ -190,6 +191,11 @@ also use a JSON line and return a nonzero exit code. Successful commands return
 `{ "ok": false, "error": { "code": "...", "message": "..." } }` and use a
 nonzero exit code. Tokens and cookies are never printed. `api get` is a
 read-only same-origin escape hatch restricted to `/api/` paths.
+
+Pass piped or redirected text to a one-shot task with `--stdin` or `-`:
+`git diff | dreyzecode run "Review these changes" --stdin --mode plan`.
+The CLI joins that text with the prompt and rejects input above 24,000
+characters. Use `--yes` when running unattended tasks that need approval.
 
 ## Current command contract
 

@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url"
 import { connectMcpServers, listConfiguredMcpServers } from "./mcp-client.mjs"
 import { describeHooks, loadConfiguredHooks, runHookEvent } from "./hooks.mjs"
 
-export const VERSION = "0.5.22"
+export const VERSION = "0.5.23"
 const MAX_STEPS = 80
 const MAX_HISTORY = 40
 const DEFAULT_HISTORY_DISPLAY_MESSAGES = 8
@@ -158,7 +158,7 @@ export async function resolveWorkspacePath(rawPath, roots, { mustExist = false, 
 
 export function parseArgs(args) {
   const commands = new Set(["login", "logout", "doctor", "models", "sessions", "skills", "hooks", "mcp", "api", "run", "chat", "help"])
-  const result = { command: "interactive", positionals: [], addDirs: [], imagePaths: [], json: false, outputFormat: "text", yes: false, continuing: false }
+  const result = { command: "interactive", positionals: [], addDirs: [], imagePaths: [], json: false, outputFormat: "text", readStdin: false, yes: false, continuing: false }
   let index = 0
   if (args[0] === "--help" || args[0] === "-h" || args[0] === "help") return { ...result, command: "help" }
   if (args[0] === "--version" || args[0] === "-v") return { ...result, command: "version" }
@@ -182,7 +182,8 @@ export function parseArgs(args) {
       result.outputFormat = arg.slice("--output-format=".length)
       if (!["text", "json", "stream-json"].includes(result.outputFormat)) throw new Error("--output-format принимает text, json или stream-json.")
       result.json = result.outputFormat === "json"
-    } else if (arg === "--yes" || arg === "-y") result.yes = true
+    } else if (arg === "--stdin" || arg === "-") result.readStdin = true
+    else if (arg === "--yes" || arg === "-y") result.yes = true
     else if (arg === "--continue" || arg === "-c") result.continuing = true
     else if (arg === "--model" || arg === "-m") {
       result.model = args[++index]
@@ -214,7 +215,23 @@ export function parseArgs(args) {
   if (result.mode && result.mode !== "build" && result.mode !== "plan") throw new Error("--mode принимает build или plan.")
   if (result.outputFormat !== "text" && result.command === "interactive") throw new Error("JSON вывод доступен для одноразовой команды run, а не для интерактивного чата.")
   if (result.outputFormat === "stream-json" && result.command !== "run") throw new Error("stream-json доступен только для одноразовой команды run.")
+  if (result.readStdin && result.command !== "run") throw new Error("--stdin доступен только для одноразовой команды run.")
   return result
+}
+
+export async function readStdinPrompt(stream = stdin, maxChars = MAX_MESSAGE_CHARS) {
+  if (stream.isTTY) throw new Error("Для --stdin перенаправьте текст в CLI или передайте его через pipe.")
+  if (!Number.isInteger(maxChars) || maxChars < 1) throw new Error("Лимит текста stdin должен быть положительным целым числом.")
+  const decoder = new StringDecoder("utf8")
+  let prompt = ""
+  for await (const chunk of stream) {
+    prompt += typeof chunk === "string" ? chunk : decoder.write(chunk)
+    if (prompt.length > maxChars) throw Object.assign(new Error(`Ввод stdin превышает лимит ${maxChars} символов.`), { code: "STDIN_TOO_LARGE" })
+  }
+  prompt += decoder.end()
+  if (prompt.length > maxChars) throw Object.assign(new Error(`Ввод stdin превышает лимит ${maxChars} символов.`), { code: "STDIN_TOO_LARGE" })
+  if (!prompt.trim()) throw Object.assign(new Error("stdin не содержит текста для задачи."), { code: "STDIN_EMPTY" })
+  return prompt.trim()
 }
 
 export function parseSlashCommand(input) {
@@ -489,6 +506,7 @@ function printHelp() {
     `Использование:\n` +
     `  dreyzecode [параметры]                 интерактивная сессия\n` +
     `  dreyzecode run "задача"                 выполнить задачу\n` +
+    `  dreyzecode run "задача" --stdin         добавить текст из pipe или перенаправления\n` +
     `  dreyzecode run "опиши фото" --image ./photo.png\n` +
     `  dreyzecode --continue                  продолжить последнюю сессию\n` +
     `  dreyzecode login [--url URL] [--remote] войти через браузер\n` +
@@ -503,7 +521,7 @@ function printHelp() {
     `  dreyzecode hooks list                  показать hooks проекта и пользователя\n` +
     `  dreyzecode mcp list                    показать настроенные MCP серверы\n` +
     `  dreyzecode api get /api/...            безопасный GET к API Dreyze\n\n` +
-    `Параметры: --model ID, --mode build|plan, --add-dir PATH, --image PATH (повторяемый), --session ID, --json, --output-format text|json|stream-json, --yes\n` +
+    `Параметры: --model ID, --mode build|plan, --add-dir PATH, --image PATH (повторяемый), --session ID, --stdin, --json, --output-format text|json|stream-json, --yes\n` +
     `В Build изменения файлов и команды требуют подтверждения. Plan разрешает только чтение.\n` +
     `В интерактивном режиме: подсказки появляются при вводе /; ↑↓ выбирают, Tab вставляет команду. Enter / открывает полный список.\n` +
     `Tab дополняет команды Dreyze, личные и проектные skills, режимы, темы и модели.\n` +
@@ -2678,10 +2696,13 @@ export async function runCli(args = process.argv.slice(2)) {
   }
   if (options.model) session.model = catalog.models.find((model) => model.id === options.model || model.name.toLowerCase() === options.model.toLowerCase()).id
   if (options.mode) session.mode = options.mode
+  const isOneShotRun = options.command === "run" || options.positionals.length > 0
+  const stdinPrompt = isOneShotRun && options.readStdin ? await readStdinPrompt() : ""
   const questioner = promptInterface(options.json || options.outputFormat === "stream-json", interactiveCatalog)
   try {
-    if (options.command === "run" || options.positionals.length > 0) {
-      return await runPrompt(options.positionals.join(" "), options, config, interactiveCatalog, session, store, roots, workspace, questioner)
+    if (isOneShotRun) {
+      const prompt = [options.positionals.join(" "), stdinPrompt].filter((part) => part.trim()).join("\n\n")
+      return await runPrompt(prompt, options, config, interactiveCatalog, session, store, roots, workspace, questioner)
     }
     return await interactive(options, config, interactiveCatalog, session, store, roots, workspace, questioner)
   } finally {

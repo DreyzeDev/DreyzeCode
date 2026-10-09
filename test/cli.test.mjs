@@ -30,6 +30,7 @@ import {
   loadUserSkills,
   parseArgs,
   parseSlashCommand,
+  readStdinPrompt,
   redactSecrets,
   recoverPendingAction,
   resumeInteractiveSession,
@@ -62,8 +63,28 @@ test("parses the product command surface with global flags before and after comm
   assert.equal(parseArgs(["run", "Inspect the project", "--output-format", "stream-json"]).outputFormat, "stream-json")
   assert.equal(parseArgs(["--output-format=stream-json", "run", "Inspect the project"]).outputFormat, "stream-json")
   assert.equal(parseArgs(["run", "Inspect the project", "--output-format", "json"]).json, true)
+  assert.equal(parseArgs(["run", "Review this diff", "--stdin"]).readStdin, true)
+  assert.equal(parseArgs(["run", "-"]).readStdin, true)
   assert.throws(() => parseArgs(["--output-format", "stream-json"]), /одноразовой команды run/u)
   assert.throws(() => parseArgs(["models", "list", "--output-format", "stream-json"]), /только для одноразовой команды run/u)
+  assert.throws(() => parseArgs(["--stdin"]), /только для одноразовой команды run/u)
+})
+
+test("reads bounded UTF-8 prompts from stdin, including a split multibyte character", async () => {
+  const stream = new PassThrough()
+  const result = readStdinPrompt(stream, 20)
+  stream.write(Buffer.from([0xd0]))
+  stream.end(Buffer.from([0x9f, 0x20, 0x6f, 0x6b]))
+  assert.equal(await result, "П ok")
+
+  const tooLarge = new PassThrough()
+  const rejected = readStdinPrompt(tooLarge, 3)
+  tooLarge.end("four")
+  await assert.rejects(rejected, { code: "STDIN_TOO_LARGE" })
+
+  const terminal = new PassThrough()
+  terminal.isTTY = true
+  await assert.rejects(readStdinPrompt(terminal), /перенаправьте текст/u)
 })
 
 test("parses DreyzeCode slash commands with multiword arguments and literal slash escape", () => {
@@ -1450,11 +1471,12 @@ test("streams one-shot run events as ordered JSON lines", { timeout: 10_000 }, a
     await writeFile(path.join(folder, "config.json"), configData, { mode: 0o600 })
   }
   const cli = fileURLToPath(new URL("../cli.mjs", import.meta.url))
-  const child = spawn(process.execPath, [cli, "run", "Say hello", "--output-format", "stream-json"], {
+  const child = spawn(process.execPath, [cli, "run", "Say hello", "--stdin", "--output-format", "stream-json"], {
     cwd: workspace,
     env: { ...process.env, XDG_CONFIG_HOME: config, APPDATA: config },
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: ["pipe", "pipe", "pipe"],
   })
+  child.stdin.end("Task details from stdin.")
   let stdoutText = ""
   let stderrText = ""
   child.stdout.setEncoding("utf8").on("data", (chunk) => { stdoutText += chunk })
@@ -1467,6 +1489,7 @@ test("streams one-shot run events as ordered JSON lines", { timeout: 10_000 }, a
   assert.equal(stderrText, "")
   assert.equal(requests.length, 2)
   assert.ok(requests.every((request) => request.cookie === cookie))
+  assert.equal(JSON.parse(requests[1].body).messages.at(-1).content, "Say hello\n\nTask details from stdin.")
   const events = stdoutText.trim().split("\n").map((line) => JSON.parse(line))
   assert.deepEqual(events.map((event) => event.type), ["system", "status", "status", "assistant", "result"])
   assert.deepEqual(events.map((event) => event.sequence), [1, 2, 3, 4, 5])
@@ -1487,7 +1510,7 @@ test("runs the CLI when invoked through the symlink npm creates for its binary",
   await symlink(cli, command, "file")
   const child = spawnSync(command, ["--version"], { encoding: "utf8" })
   assert.equal(child.status, 0, child.stderr)
-  assert.equal(child.stdout, "DreyzeCode 0.5.22\n")
+  assert.equal(child.stdout, "DreyzeCode 0.5.23\n")
 })
 
 test("help documents image input in both one-shot and interactive modes", async () => {
