@@ -764,13 +764,16 @@ test("lists workspace skills without requiring a Dreyze login", async (t) => {
 
 test("lists personal slash skills without requiring a Dreyze login", async (t) => {
   const { workspace, config } = await fixture(t)
-  const skillDir = path.join(config, "dreyze-code", "skills", "my-review")
+  const userConfigRoot = process.platform === "win32" ? path.join(config, "DreyzeCode") : path.join(config, "dreyze-code")
+  const skillDir = path.join(userConfigRoot, "skills", "my-review")
   await mkdir(skillDir, { recursive: true })
   await writeFile(path.join(skillDir, "SKILL.md"), "---\nname: My Review\ndescription: My personal checklist.\n---\n")
   const cli = fileURLToPath(new URL("../cli.mjs", import.meta.url))
   const child = spawnSync(process.execPath, [cli, "--json", "skills", "list"], {
     cwd: workspace,
-    env: { ...process.env, XDG_CONFIG_HOME: config },
+    env: process.platform === "win32"
+      ? { ...process.env, APPDATA: config }
+      : { ...process.env, XDG_CONFIG_HOME: config },
     encoding: "utf8",
   })
   assert.equal(child.status, 0, child.stderr)
