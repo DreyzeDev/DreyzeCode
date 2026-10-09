@@ -698,9 +698,10 @@ test("stops a running shell command when the agent task is cancelled", async (t)
   const controller = new AbortController()
   const startedMarker = path.join(workspace, "cancel-child-started.txt")
   const lateMarker = path.join(workspace, "cancel-child-late.txt")
-  const childScript = `require("fs").writeFileSync(${JSON.stringify(startedMarker)},"started"); setTimeout(()=>require("fs").writeFileSync(${JSON.stringify(lateMarker)},"late"),1500)`
+  const childScriptPath = path.join(workspace, "cancel-child.js")
+  await writeFile(childScriptPath, `require("fs").writeFileSync(${JSON.stringify(startedMarker)},"started"); setTimeout(()=>require("fs").writeFileSync(${JSON.stringify(lateMarker)},"late"),1500)`)
   const command = process.platform === "win32"
-    ? `& "${process.execPath.replaceAll('"', '""')}" -e '${childScript}'`
+    ? `& "${process.execPath.replaceAll('"', '""')}" "${childScriptPath.replaceAll('"', '""')}"`
     : "sleep 2"
   const execution = executeTool({ name: "run_command", input: { command } }, {
     workspace,
