@@ -206,12 +206,14 @@ test("runs a background research task in its own read-only session without chang
   const environment = { ...process.env, XDG_CONFIG_HOME: config, APPDATA: config }
   const invoke = (args) => new Promise((resolvePromise, rejectPromise) => {
     const child = spawn(process.execPath, [cli, ...args], { cwd: workspace, env: environment, stdio: ["ignore", "pipe", "pipe"] })
+    let timedOut = false
+    const timer = setTimeout(() => { timedOut = true; child.kill() }, 10_000)
     let stdoutText = ""
     let stderrText = ""
     child.stdout.setEncoding("utf8").on("data", (chunk) => { stdoutText += chunk })
     child.stderr.setEncoding("utf8").on("data", (chunk) => { stderrText += chunk })
-    child.once("error", rejectPromise)
-    child.once("close", (code) => resolvePromise({ code, stdout: stdoutText, stderr: stderrText }))
+    child.once("error", (error) => { clearTimeout(timer); rejectPromise(error) })
+    child.once("close", (code) => { clearTimeout(timer); resolvePromise({ code, stdout: stdoutText, stderr: stderrText, timedOut }) })
   })
 
   const started = await invoke(["agents", "start", "Inspect the project safely", "--mode", "plan", "--json"])
@@ -220,6 +222,10 @@ test("runs a background research task in its own read-only session without chang
   assert.equal(startResult.ok, true)
   const id = startResult.agent.id
   const attached = await invoke(["agents", "attach", id, "--json"])
+  if (attached.timedOut) {
+    const state = await invoke(["agents", "show", id, "--json"])
+    assert.fail(`Agent attach timed out. Current state: ${state.stdout}`)
+  }
   assert.equal(attached.code, 0, attached.stderr)
   const result = JSON.parse(attached.stdout)
   assert.equal(result.ok, true)
@@ -278,12 +284,14 @@ test("background Build agents wait for a direct approval before modifying the pr
   const environment = { ...process.env, XDG_CONFIG_HOME: config, APPDATA: config }
   const invoke = (args) => new Promise((resolvePromise, rejectPromise) => {
     const child = spawn(process.execPath, [cli, ...args], { cwd: workspace, env: environment, stdio: ["ignore", "pipe", "pipe"] })
+    let timedOut = false
+    const timer = setTimeout(() => { timedOut = true; child.kill() }, 10_000)
     let stdoutText = ""
     let stderrText = ""
     child.stdout.setEncoding("utf8").on("data", (chunk) => { stdoutText += chunk })
     child.stderr.setEncoding("utf8").on("data", (chunk) => { stderrText += chunk })
-    child.once("error", rejectPromise)
-    child.once("close", (code) => resolvePromise({ code, stdout: stdoutText, stderr: stderrText }))
+    child.once("error", (error) => { clearTimeout(timer); rejectPromise(error) })
+    child.once("close", (code) => { clearTimeout(timer); resolvePromise({ code, stdout: stdoutText, stderr: stderrText, timedOut }) })
   })
 
   const started = await invoke(["agents", "start", "Create approved.txt", "--mode", "build", "--json"])
@@ -321,6 +329,10 @@ test("background Build agents wait for a direct approval before modifying the pr
   assert.equal(approval.code, 0, approval.stderr)
   assert.equal(JSON.parse(approval.stdout).decision, "approved")
   const attached = await invoke(["agents", "attach", id, "--json"])
+  if (attached.timedOut) {
+    const state = await invoke(["agents", "show", id, "--json"])
+    assert.fail(`Agent attach timed out. Current state: ${state.stdout}`)
+  }
   assert.equal(attached.code, 0, attached.stderr)
   assert.equal(JSON.parse(attached.stdout).agent.status, "completed")
   assert.equal(await readFile(path.join(workspace, "approved.txt"), "utf8"), "confirmed content")
