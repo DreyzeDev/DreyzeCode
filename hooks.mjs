@@ -2,7 +2,7 @@ import { createHash } from "node:crypto"
 import { spawn } from "node:child_process"
 import { env, platform } from "node:process"
 import { lstat, readFile, realpath } from "node:fs/promises"
-import { isAbsolute, join, relative, sep } from "node:path"
+import { isAbsolute, join, relative, resolve, sep } from "node:path"
 
 const MAX_CONFIG_BYTES = 64_000
 const MAX_HOOKS_PER_FILE = 40
@@ -14,6 +14,11 @@ const MAX_TIMEOUT_MS = 30_000
 const ALLOWED_EVENTS = new Set(["beforeTool", "afterTool"])
 
 function within(root, candidate) {
+  if (platform === "win32") {
+    const normalizedRoot = normalizeRealPath(resolve(root)).replace(/[\\/]+$/u, "").toLowerCase()
+    const normalizedCandidate = normalizeRealPath(resolve(candidate)).replace(/[\\/]+$/u, "").toLowerCase()
+    return normalizedCandidate === normalizedRoot || normalizedCandidate.startsWith(`${normalizedRoot}\\`)
+  }
   const rel = relative(root, candidate)
   return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel))
 }
