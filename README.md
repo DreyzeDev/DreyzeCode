@@ -42,7 +42,9 @@ Build mode can read and search project files. It asks before changing files,
 running commands, or creating folders. Plan mode is read-only. Run commands are
 executed from the selected project directory: PowerShell on Windows and POSIX
 `/bin/sh` on Linux and macOS. The model receives the active shell type so it can
-choose matching command syntax. Secret and credential files are
+choose matching command syntax. In an interactive terminal, command output
+streams as it arrives; control sequences are stripped, credential patterns are
+redacted, and the live preview is capped per command. Secret and credential files are
 blocked from reads and searches. Build can ask permission to start an isolated,
 read-only research subagent; its findings appear in the parent session and its
 own session remains available in the session list. Moving a folder renames it

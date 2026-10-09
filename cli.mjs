@@ -2,6 +2,7 @@
 import { createHash, randomUUID } from "node:crypto"
 import { spawn } from "node:child_process"
 import { createInterface } from "node:readline"
+import { StringDecoder } from "node:string_decoder"
 import { homedir } from "node:os"
 import { env, platform, stdin, stdout, stderr } from "node:process"
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
@@ -10,7 +11,7 @@ import { fileURLToPath } from "node:url"
 import { connectMcpServers, listConfiguredMcpServers } from "./mcp-client.mjs"
 import { describeHooks, loadConfiguredHooks, runHookEvent } from "./hooks.mjs"
 
-export const VERSION = "0.5.20"
+export const VERSION = "0.5.21"
 const MAX_STEPS = 80
 const MAX_HISTORY = 40
 const DEFAULT_HISTORY_DISPLAY_MESSAGES = 8
@@ -874,7 +875,7 @@ async function assertParentAllowed(pathname, roots) {
   if (!within(allowedRoot, existing)) throw new Error("Путь через символьную ссылку выходит за разрешённую папку.")
 }
 
-async function runShell(command, workspace, abortSignal) {
+async function runShell(command, workspace, abortSignal, onOutputChunk) {
   if (typeof command !== "string" || !command.trim() || command.length > 4_000) throw new Error("Укажите команду длиной до 4000 символов.")
   const shell = platform === "win32" ? "powershell.exe" : "/bin/sh"
   const powershellCommand = `[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding; $OutputEncoding = [Console]::OutputEncoding; $ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'; ${command}; if ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE }`
@@ -894,11 +895,17 @@ async function runShell(command, workspace, abortSignal) {
     let output = ""
     let timedOut = false
     let stopRequested = false
-    const add = (chunk, label) => {
-      if (output.length < 50_000) output += `${label}${chunk.toString("utf8")}`.slice(0, 50_000 - output.length)
+    const stdoutDecoder = new StringDecoder("utf8")
+    const stderrDecoder = new StringDecoder("utf8")
+    const add = (text, label) => {
+      if (!text) return
+      if (output.length < 50_000) output += `${label}${text}`.slice(0, 50_000 - output.length)
+      try { onOutputChunk?.(`${label}${text}`) } catch {}
     }
-    child.stdout.on("data", (chunk) => add(chunk, ""))
-    child.stderr.on("data", (chunk) => add(chunk, "[stderr] "))
+    child.stdout.on("data", (chunk) => add(stdoutDecoder.write(chunk), ""))
+    child.stderr.on("data", (chunk) => add(stderrDecoder.write(chunk), "[stderr] "))
+    child.stdout.once("end", () => add(stdoutDecoder.end(), ""))
+    child.stderr.once("end", () => add(stderrDecoder.end(), "[stderr] "))
     const stopProcessTree = () => {
       if (stopRequested) return
       stopRequested = true
@@ -949,7 +956,7 @@ async function runShell(command, workspace, abortSignal) {
   })
 }
 
-export async function executeTool(action, { workspace, roots, approve, question, delegate, webSearch, signal }) {
+export async function executeTool(action, { workspace, roots, approve, question, delegate, webSearch, onToolOutput, signal }) {
   const input = action.input || {}
   const getPath = (name = "path", required = true) => {
     const value = input[name]
@@ -1043,7 +1050,12 @@ export async function executeTool(action, { workspace, roots, approve, question,
   }
   if (action.name === "run_command") {
     if (!(await askApproval(action, { approve, question }))) return { output: "Действие отклонено пользователем." }
-    const result = await runShell(getPath("command"), workspace, signal)
+    let result
+    try {
+      result = await runShell(getPath("command"), workspace, signal, onToolOutput)
+    } finally {
+      try { onToolOutput?.("", { flush: true }) } catch {}
+    }
     return { output: `Код завершения: ${result.code}${result.timedOut ? " (тайм-аут 120 секунд)" : ""}${result.signal ? `; сигнал ${result.signal}` : ""}\n${result.output || "(команда не вывела текст)"}` }
   }
   if (["copy_file", "move_file"].includes(action.name)) {
@@ -1218,9 +1230,112 @@ function startWaitIndicator(step, activity = "ответ модели") {
   render()
   const timer = setInterval(render, 900)
   timer.unref()
-  return () => {
+  const stop = () => {
     clearInterval(timer)
     stderr.write("\r\u001b[2K")
+  }
+  stop.writeOutput = (line) => {
+    if (!stderr.isTTY || typeof line !== "string") return
+    stderr.write("\r\u001b[2K")
+    const width = Math.max(32, Math.min(100, Number.isInteger(stdout.columns) ? stdout.columns : 76))
+    const wrapped = wrapTerminalLine(line, width - 4)
+    const dim = env.NO_COLOR === undefined ? "\u001b[90m" : ""
+    const reset = dim ? "\u001b[0m" : ""
+    for (const outputLine of wrapped) stderr.write(`${dim}│ ${outputLine}${reset}\n`)
+    render()
+  }
+  return stop
+}
+
+export function createLiveToolOutputStream(writeLine, maxChars = MAX_TOOL_OUTPUT) {
+  if (typeof writeLine !== "function") throw new TypeError("writeLine must be a function")
+  const limit = Number.isInteger(maxChars) ? Math.max(1, maxChars) : MAX_TOOL_OUTPUT
+  let pending = ""
+  let displayed = 0
+  let truncated = false
+  let omittingLongLine = false
+  let omittingPrivateKey = false
+  const privateKeyStart = /-----BEGIN [A-Z ]*PRIVATE KEY-----/u
+  const privateKeyEnd = /-----END [A-Z ]*PRIVATE KEY-----/u
+  const emit = (line) => {
+    const safe = redactSecrets(safeTerminalText(line))
+    const remaining = limit - displayed
+    if (remaining <= 0) {
+      if (!truncated) writeLine(`[Потоковый вывод сокращён до ${limit} символов.]`)
+      truncated = true
+      return
+    }
+    const visible = safe.slice(0, remaining)
+    writeLine(visible)
+    displayed += visible.length
+    if (visible.length < safe.length && !truncated) {
+      writeLine(`[Потоковый вывод сокращён до ${limit} символов.]`)
+      truncated = true
+    }
+  }
+  const emitSafeLine = (line) => {
+    if (omittingPrivateKey) {
+      if (privateKeyEnd.test(line)) {
+        writeLine("[PRIVATE KEY OMITTED]")
+        omittingPrivateKey = false
+      }
+      return
+    }
+    if (privateKeyStart.test(line) && !privateKeyEnd.test(line)) {
+      omittingPrivateKey = true
+      return
+    }
+    emit(line)
+  }
+  return (chunk, options = {}) => {
+    const flush = options === true || options?.flush === true
+    if (chunk) pending += String(chunk)
+    const lines = pending.replace(/\r\n/gu, "\n").replace(/\r/gu, "\n").split("\n")
+    pending = lines.pop() ?? ""
+    for (const line of lines) {
+      if (omittingLongLine) {
+        writeLine("[Длинная строка пропущена в потоке вывода.]")
+        omittingLongLine = false
+        if (omittingPrivateKey && privateKeyEnd.test(line)) {
+          writeLine("[PRIVATE KEY OMITTED]")
+          omittingPrivateKey = false
+        }
+      } else emitSafeLine(line)
+    }
+    if (pending.length > 4_000) {
+      if (privateKeyStart.test(pending) && !privateKeyEnd.test(pending)) omittingPrivateKey = true
+      pending = ""
+      omittingLongLine = true
+    }
+    if (flush) {
+      if (omittingLongLine) writeLine("[Длинная строка пропущена в потоке вывода.]")
+      else if (omittingPrivateKey) writeLine("[PRIVATE KEY OMITTED]")
+      else if (pending) emitSafeLine(pending)
+      pending = ""
+      omittingLongLine = false
+      omittingPrivateKey = false
+      displayed = 0
+      truncated = false
+    }
+  }
+}
+
+function createTerminalProgressCallbacks({ streamOutput = true } = {}) {
+  let activeIndicator = null
+  const stream = createLiveToolOutputStream((line) => activeIndicator?.writeOutput?.(line))
+  return {
+    onActivity(activity, step) {
+      const indicator = startWaitIndicator(step, activity)
+      activeIndicator = indicator
+      return () => {
+        indicator()
+        if (activeIndicator === indicator) activeIndicator = null
+      }
+    },
+    onToolOutput(chunk, options = {}) {
+      if (streamOutput && stderr.isTTY) stream(chunk, options)
+      else if (options?.flush) stream("", { flush: true })
+    },
   }
 }
 
@@ -1299,7 +1414,7 @@ async function approveMcpTool(action, mcp, { yes, question }) {
   return typeof answer === "string" && /^(y|yes|д|да)$/iu.test(answer.trim())
 }
 
-export async function runAgentTask({ config, catalog, session, store, roots, workspace, question, yes = false, fetchImpl = fetch, onOutput = () => {}, onActivity = () => () => {}, signal }) {
+export async function runAgentTask({ config, catalog, session, store, roots, workspace, question, yes = false, fetchImpl = fetch, onOutput = () => {}, onActivity = () => () => {}, onToolOutput = () => {}, signal }) {
   assertAgentNotCancelled(signal)
   await recoverPendingAction(session, store)
   const [projectInstructions, discoveredSkills] = await Promise.all([
@@ -1425,6 +1540,7 @@ export async function runAgentTask({ config, catalog, session, store, roots, wor
         approve: async () => true,
         question,
         yes: true,
+        onToolOutput,
         signal,
         delegate: async (task) => {
           if (typeof store.fork !== "function") throw new Error("Не удалось создать отдельную сессию подагента.")
@@ -2053,13 +2169,15 @@ async function runPrompt(prompt, options, config, catalog, session, store, roots
   else appendMessage(session, "user", prompt, imagePaths)
   await store.save(session)
   const cancellation = new AbortController()
+  const progress = createTerminalProgressCallbacks({ streamOutput: !options.json })
   questioner.setInterruptHandler?.(() => cancellation.abort())
   let result
   try {
     result = await runAgentTask({
       config, catalog, session, store, roots, workspace, yes: options.yes,
       question: questioner.ask,
-      onActivity: (activity, step) => startWaitIndicator(step, activity),
+      onActivity: progress.onActivity,
+      onToolOutput: progress.onToolOutput,
       onOutput: (text) => {
         if (options.json) return
         if (typeof options.chatColor === "function") writeChatMessage(`DreyzeCode · ${session.model} · ${session.mode}`, text, options.chatColor)
@@ -2097,6 +2215,7 @@ export async function resumeInteractiveSession({
 }) {
   if (!options.continuing) return false
   const cancellation = new AbortController()
+  const progress = createTerminalProgressCallbacks({ streamOutput: !options.json })
   questioner.setInterruptHandler?.(() => cancellation.abort())
   try {
     if (session.pendingQuestion) {
@@ -2124,6 +2243,8 @@ export async function resumeInteractiveSession({
       question: questioner.ask,
       yes: options.yes,
       onOutput,
+      onActivity: progress.onActivity,
+      onToolOutput: progress.onToolOutput,
       signal: cancellation.signal,
     })
     return true

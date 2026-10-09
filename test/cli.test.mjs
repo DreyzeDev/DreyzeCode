@@ -12,6 +12,7 @@ import {
   builtInSlashTask,
   copyToClipboard,
   createSessionStore,
+  createLiveToolOutputStream,
   apiGet,
   buildSkillPrompt,
   completeSlashInput,
@@ -914,6 +915,81 @@ test("runs approved commands in the platform shell", async (t) => {
   assert.match(result.output, /Dreyze shell execution verified/u)
 })
 
+test("streams approved shell output before the command exits", { timeout: 5_000 }, async (t) => {
+  const { workspace } = await fixture(t)
+  const command = process.platform === "win32"
+    ? "Write-Output 'stream-started'; Start-Sleep -Milliseconds 300; Write-Output 'stream-finished'"
+    : "printf 'stream-started\\n'; sleep 0.3; printf 'stream-finished\\n'"
+  let resolveFirstOutput
+  const firstOutput = new Promise((resolvePromise) => { resolveFirstOutput = resolvePromise })
+  let settled = false
+  let flushed = false
+  const chunks = []
+  const execution = executeTool({ name: "run_command", input: { command } }, {
+    workspace,
+    roots: [workspace],
+    approve: async () => true,
+    question: async () => null,
+    onToolOutput: (chunk, options) => {
+      if (chunk) {
+        chunks.push(chunk)
+        if (chunk.includes("stream-started")) resolveFirstOutput()
+      }
+      if (options?.flush) flushed = true
+    },
+  }).finally(() => { settled = true })
+  await firstOutput
+  assert.equal(settled, false)
+  const result = await execution
+  assert.ok(flushed)
+  assert.match(chunks.join(""), /stream-started/u)
+  assert.match(result.output, /stream-finished/u)
+})
+
+test("formats live shell output safely and limits each command preview", () => {
+  const lines = []
+  const stream = createLiveToolOutputStream((line) => lines.push(line), 100)
+  stream("sk-abcdefghijklmnop")
+  stream("qrstuvwxyz123456\n\u001b[31mred\u001b[0m\n", { flush: true })
+  assert.deepEqual(lines, ["[API KEY OMITTED]", "red"])
+
+  const limited = []
+  const limitedStream = createLiveToolOutputStream((line) => limited.push(line), 10)
+  limitedStream("123456789012\nnext\n", { flush: true })
+  assert.deepEqual(limited, ["1234567890", "[Потоковый вывод сокращён до 10 символов.]"])
+
+  const longLine = []
+  const longLineStream = createLiveToolOutputStream((line) => longLine.push(line))
+  longLineStream("x".repeat(4_001) + "sk-abcdefghijklmnop")
+  longLineStream("\nnext\n", { flush: true })
+  assert.deepEqual(longLine, ["[Длинная строка пропущена в потоке вывода.]", "next"])
+
+  const privateKey = []
+  const privateKeyStream = createLiveToolOutputStream((line) => privateKey.push(line))
+  privateKeyStream("-----BEGIN PRIVATE KEY-----\n")
+  privateKeyStream("secret-key-material\n-----END PRIVATE KEY-----\npublic output\n", { flush: true })
+  assert.deepEqual(privateKey, ["[PRIVATE KEY OMITTED]", "public output"])
+})
+
+test("keeps UTF-8 characters intact when shell output splits a character across chunks", async (t) => {
+  const { workspace } = await fixture(t)
+  const scriptPath = path.join(workspace, "split-utf8-output.cjs")
+  await writeFile(scriptPath, "process.stdout.write(Buffer.from([0xd0])); setTimeout(() => process.stdout.write(Buffer.from([0x96])), 100)")
+  const command = process.platform === "win32"
+    ? `& "${process.execPath.replaceAll('"', '""')}" "${scriptPath.replaceAll('"', '""')}"`
+    : `"${process.execPath}" "${scriptPath}"`
+  const streamed = []
+  const result = await executeTool({ name: "run_command", input: { command } }, {
+    workspace,
+    roots: [workspace],
+    approve: async () => true,
+    question: async () => null,
+    onToolOutput: (chunk) => streamed.push(chunk),
+  })
+  assert.match(result.output, /Ж/u)
+  assert.match(streamed.join(""), /Ж/u)
+})
+
 test("stops a running shell command when the agent task is cancelled", async (t) => {
   const { workspace } = await fixture(t)
   const controller = new AbortController()
@@ -1346,7 +1422,7 @@ test("runs the CLI when invoked through the symlink npm creates for its binary",
   await symlink(cli, command, "file")
   const child = spawnSync(command, ["--version"], { encoding: "utf8" })
   assert.equal(child.status, 0, child.stderr)
-  assert.equal(child.stdout, "DreyzeCode 0.5.20\n")
+  assert.equal(child.stdout, "DreyzeCode 0.5.21\n")
 })
 
 test("help documents image input in both one-shot and interactive modes", async () => {
