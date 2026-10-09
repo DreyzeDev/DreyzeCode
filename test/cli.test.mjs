@@ -696,8 +696,12 @@ test("runs approved commands in the platform shell", async (t) => {
 test("stops a running shell command when the agent task is cancelled", async (t) => {
   const { workspace } = await fixture(t)
   const controller = new AbortController()
-  const command = process.platform === "win32" ? "Start-Sleep -Seconds 2" : "sleep 2"
-  const startedAt = Date.now()
+  const startedMarker = path.join(workspace, "cancel-child-started.txt")
+  const lateMarker = path.join(workspace, "cancel-child-late.txt")
+  const childScript = `require("fs").writeFileSync(${JSON.stringify(startedMarker)},"started"); setTimeout(()=>require("fs").writeFileSync(${JSON.stringify(lateMarker)},"late"),1500)`
+  const command = process.platform === "win32"
+    ? `& "${process.execPath.replaceAll('"', '""')}" -e '${childScript}'`
+    : "sleep 2"
   const execution = executeTool({ name: "run_command", input: { command } }, {
     workspace,
     roots: [workspace],
@@ -705,11 +709,24 @@ test("stops a running shell command when the agent task is cancelled", async (t)
     question: async () => null,
     signal: controller.signal,
   })
-  await new Promise((resolvePromise) => setTimeout(resolvePromise, 100))
+  if (process.platform === "win32") {
+    const deadline = Date.now() + 5_000
+    while (Date.now() < deadline && !(await access(startedMarker).then(() => true, () => false))) {
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 25))
+    }
+    assert.equal(await access(startedMarker).then(() => true, () => false), true, "the PowerShell child should start before cancellation")
+  } else {
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 100))
+  }
+  const cancellationStartedAt = Date.now()
   controller.abort()
   const result = await execution
-  assert.ok(Date.now() - startedAt < 1_500, "the shell process should stop promptly")
+  assert.ok(Date.now() - cancellationStartedAt < 1_500, "the shell process should stop promptly")
   assert.notEqual(result.code, 0)
+  if (process.platform === "win32") {
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 1_700))
+    await assert.rejects(readFile(lateMarker, "utf8"), { code: "ENOENT" }, "cancellation should stop the spawned process tree")
+  }
 })
 
 test("denies a file write unless the user approves it", async (t) => {
@@ -1107,7 +1124,7 @@ test("runs the CLI when invoked through the symlink npm creates for its binary",
   await symlink(cli, command, "file")
   const child = spawnSync(command, ["--version"], { encoding: "utf8" })
   assert.equal(child.status, 0, child.stderr)
-  assert.equal(child.stdout, "DreyzeCode 0.5.15\n")
+  assert.equal(child.stdout, "DreyzeCode 0.5.16\n")
 })
 
 test("help documents image input in both one-shot and interactive modes", async () => {

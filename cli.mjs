@@ -9,7 +9,7 @@ import { access, chmod, copyFile, lstat, mkdir, open, readdir, readFile, realpat
 import { fileURLToPath } from "node:url"
 import { connectMcpServers, listConfiguredMcpServers } from "./mcp-client.mjs"
 
-export const VERSION = "0.5.15"
+export const VERSION = "0.5.16"
 const MAX_STEPS = 80
 const MAX_HISTORY = 40
 const DEFAULT_HISTORY_DISPLAY_MESSAGES = 8
@@ -840,14 +840,33 @@ async function runShell(command, workspace, abortSignal) {
     })
     let output = ""
     let timedOut = false
+    let stopRequested = false
     const add = (chunk, label) => {
       if (output.length < 50_000) output += `${label}${chunk.toString("utf8")}`.slice(0, 50_000 - output.length)
     }
     child.stdout.on("data", (chunk) => add(chunk, ""))
     child.stderr.on("data", (chunk) => add(chunk, "[stderr] "))
     const stopProcessTree = () => {
+      if (stopRequested) return
+      stopRequested = true
       if (platform === "win32") {
-        child.kill()
+        if (!child.pid) {
+          child.kill()
+          return
+        }
+        let killer
+        try {
+          killer = spawn("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], {
+            stdio: "ignore",
+            windowsHide: true,
+          })
+        } catch {
+          child.kill()
+          return
+        }
+        const fallback = () => child.kill()
+        killer.once("error", fallback)
+        killer.once("close", (code) => { if (code !== 0) fallback() })
         return
       }
       if (!child.pid) {
