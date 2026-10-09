@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url"
 import { connectMcpServers, listConfiguredMcpServers } from "./mcp-client.mjs"
 import { describeHooks, loadConfiguredHooks, runHookEvent } from "./hooks.mjs"
 
-export const VERSION = "0.5.27"
+export const VERSION = "0.5.28"
 const MAX_STEPS = 80
 const MAX_HISTORY = 40
 const MAX_CHECKPOINTS = 100
@@ -1024,7 +1024,7 @@ async function validateRewindPath(pathname, roots) {
 
 function checkpointPathMatches(actual, expected) {
   if (!expected) return !actual.exists
-  return actual.exists && actual.kind === expected.kind && actual.hash === expected.hash && (expected.mode === undefined || actual.mode === expected.mode)
+  return actual.exists && actual.kind === expected.kind && actual.hash === expected.hash && (expected.mode === undefined || platform === "win32" || actual.mode === expected.mode)
 }
 
 export async function rewindSession(session, store, { roots, number = 1 } = {}) {
