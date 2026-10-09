@@ -9,7 +9,7 @@ import { access, chmod, copyFile, lstat, mkdir, open, readdir, readFile, realpat
 import { fileURLToPath } from "node:url"
 import { connectMcpServers, listConfiguredMcpServers } from "./mcp-client.mjs"
 
-export const VERSION = "0.5.13"
+export const VERSION = "0.5.14"
 const MAX_STEPS = 80
 const MAX_HISTORY = 40
 const DEFAULT_HISTORY_DISPLAY_MESSAGES = 8
@@ -40,6 +40,8 @@ export const SLASH_COMMANDS = Object.freeze([
   { name: "theme", usage: "/theme purple|blue|system", description: "изменить оформление терминала" },
   { name: "status", usage: "/status", description: "показать текущую сессию и проект" },
   { name: "history", usage: "/history [число]", description: "показать последние сообщения чата" },
+  { name: "copy", usage: "/copy", description: "скопировать последний ответ модели" },
+  { name: "rename", usage: "/rename <название>", description: "дать имя текущей сессии" },
   { name: "sessions", usage: "/sessions", description: "показать последние сессии проекта" },
   { name: "resume", usage: "/resume [ID]", description: "открыть сессию по ID или последнюю" },
   { name: "new", usage: "/new", description: "начать новую сессию" },
@@ -67,6 +69,50 @@ export function isSensitivePath(pathname) {
   return name === ".env" || name.startsWith(".env.") ||
     /(^|[._-])(secret|credential|password|token|api[-_]?key|private[-_]?key)([._-]|$)/iu.test(name) ||
     /\.(pem|key|p12|pfx)$/iu.test(name) || ["id_rsa", "id_ed25519"].includes(name)
+}
+
+export function clipboardTargets(platformName = platform) {
+  if (platformName === "win32") {
+    return [{ command: "powershell.exe", args: ["-NoLogo", "-NoProfile", "-NonInteractive", "-STA", "-Command", "$b=[Console]::In.ReadLine(); if ($null -eq $b) { exit 1 }; $t=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b)); Set-Clipboard -Value $t"], encoding: "base64" }]
+  }
+  if (platformName === "darwin") return [{ command: "pbcopy", args: [], encoding: "utf8" }]
+  return [
+    { command: "wl-copy", args: [], encoding: "utf8" },
+    { command: "xclip", args: ["-selection", "clipboard", "-in"], encoding: "utf8" },
+    { command: "xsel", args: ["--clipboard", "--input"], encoding: "utf8" },
+  ]
+}
+
+export async function copyToClipboard(value, { platformName = platform, spawnImpl = spawn } = {}) {
+  const text = String(value)
+  const targets = clipboardTargets(platformName)
+  let lastError
+  for (const target of targets) {
+    try {
+      await new Promise((resolvePromise, rejectPromise) => {
+        const child = spawnImpl(target.command, target.args, { stdio: ["pipe", "ignore", "pipe"], windowsHide: true })
+        let settled = false
+        let errorText = ""
+        const finish = (error) => {
+          if (settled) return
+          settled = true
+          if (error) rejectPromise(error)
+          else resolvePromise()
+        }
+        child.stderr?.on("data", (chunk) => { errorText = `${errorText}${chunk}`.slice(-1_000) })
+        child.once("error", finish)
+        child.stdin.once("error", finish)
+        child.once("close", (code) => finish(code === 0 ? null : new Error(errorText || `Clipboard exited with code ${code}.`)))
+        const payload = target.encoding === "base64" ? `${Buffer.from(text, "utf8").toString("base64")}\n` : text
+        child.stdin.end(payload)
+      })
+      return target.command
+    } catch (error) {
+      lastError = error
+    }
+  }
+  const hint = platformName === "darwin" ? "pbcopy" : platformName === "win32" ? "PowerShell Set-Clipboard" : "wl-copy, xclip или xsel"
+  throw Object.assign(new Error(`Не удалось скопировать ответ. Проверьте доступность буфера обмена (${hint}).`), { cause: lastError })
 }
 
 async function nearestExistingPath(pathname) {
@@ -397,7 +443,7 @@ function printHelp() {
     `В Build изменения файлов и команды требуют подтверждения. Plan разрешает только чтение.\n` +
     `В интерактивном режиме: подсказки появляются при вводе /; Enter / открывает полный список.\n` +
     `Tab дополняет команды проекта, режимы, темы и модели.\n` +
-    `Команды: /help, /skills, /mode, /model, /attach, /detach, /theme, /status, /history, /sessions, /resume, /new, /clear, /exit.\n` +
+    `Команды: /help, /skills, /mode, /model, /attach, /detach, /theme, /status, /history, /copy, /rename, /sessions, /resume, /new, /clear, /exit.\n` +
     `Проектный skill запускается как /<имя-папки> задача.\n`)
 }
 
@@ -1662,7 +1708,8 @@ async function interactive(options, config, catalog, initialSession, store, root
   let pendingImagePaths = [...(options.imagePaths ?? [])]
   const printSessionHeader = () => {
     const mode = session.mode === "plan" ? "Plan · только чтение" : "Build · изменения с подтверждением"
-    writeChatMessage("DreyzeCode", `Проект: ${workspace}\nМодель: ${session.model}\nРежим: ${mode}`, color)
+    const title = session.title ? `Название: ${session.title}\n` : ""
+    writeChatMessage("DreyzeCode", `${title}Проект: ${workspace}\nМодель: ${session.model}\nРежим: ${mode}`, color)
   }
   const printModels = () => {
     const rows = catalog.models.map((model) => `${model.id === session.model ? "●" : "○"} ${model.name} · ${model.id}${model.supportsImages ? " · images" : ""}`)
@@ -1796,13 +1843,37 @@ async function interactive(options, config, catalog, initialSession, store, root
       }
       if (name === "status") {
         const attachments = pendingImagePaths.length ? pendingImagePaths.map(basename).join(", ") : "нет"
-        writeChatMessage("Состояние сессии", `ID: ${session.id}\nМодель: ${session.model}\nРежим: ${session.mode}\nПроект: ${workspace}\nВложения: ${attachments}`, color)
+        const title = session.title ? `Название: ${session.title}\n` : ""
+        writeChatMessage("Состояние сессии", `${title}ID: ${session.id}\nМодель: ${session.model}\nРежим: ${session.mode}\nПроект: ${workspace}\nВложения: ${attachments}`, color)
         continue
       }
       if (name === "history") {
         const requested = value ? Number(value) : DEFAULT_HISTORY_DISPLAY_MESSAGES
         if (!Number.isInteger(requested) || requested < 1) writeChatMessage("История чата", "Использование: /history [число от 1 до 30].", color)
         else printSessionHistory(Math.min(requested, MAX_HISTORY_DISPLAY_MESSAGES))
+        continue
+      }
+      if (name === "copy") {
+        const answer = session.messages.findLast((message) => message.role === "assistant" && message.content.trim())
+        if (!answer) writeChatMessage("Буфер обмена", "В этой сессии пока нет ответа для копирования.", color)
+        else {
+          try {
+            await copyToClipboard(answer.content)
+            writeChatMessage("Ответ скопирован", "Последний ответ DreyzeCode готов к вставке.", color)
+          } catch (error) {
+            writeChatMessage("Буфер обмена", error instanceof Error ? error.message : "Не удалось скопировать ответ.", color)
+          }
+        }
+        continue
+      }
+      if (name === "rename") {
+        const title = takeTerminalCells(safeTerminalText(value).replace(/\s+/gu, " ").trim(), 80)
+        if (!title) writeChatMessage("Название сессии", "Использование: /rename название проекта или задачи", color)
+        else {
+          session.title = title
+          await store.save(session)
+          writeChatMessage("Сессия переименована", title, color)
+        }
         continue
       }
       if (name === "sessions") {

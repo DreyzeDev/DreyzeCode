@@ -63,7 +63,9 @@ is working. Slash command suggestions appear as you type, including choices
 for modes, themes, and models. Enter `/` to open the full command palette or
 press Tab to complete a command. `/help` lists the built-in commands and
 project commands. Use `/skill-name task` to run a project command with a task,
-or `/skills` to list project commands. Use `/history [number]` to view recent
+or `/skills` to list project commands. `/copy` puts the latest model reply on
+the system clipboard, and `/rename NAME` gives the current conversation a
+recognizable title in the session list. Use `/history [number]` to view recent
 user and assistant messages in the current session; tool payloads stay hidden.
 Prefix a message with `//` when it should start with a literal `/`.
 
@@ -138,6 +140,8 @@ read-only same-origin escape hatch restricted to `/api/` paths.
 - `skills list` for project-local capabilities
 - `mcp list` for configured local and remote MCP servers
 - Interactive chat, `run`, `--continue`, `--session`, `--model`, and `--mode`
+- Slash commands for chat history, copying replies, naming and resuming sessions,
+  themes, models, and project-defined skills
 - Local tools: list/read/search, image input, create/copy/move/write/edit/delete
   files, create folders, run approved commands, search the web using the
   account's monthly search allowance, ask the user, and start a read-only

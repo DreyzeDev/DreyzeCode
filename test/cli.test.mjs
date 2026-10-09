@@ -5,7 +5,11 @@ import path from "node:path"
 import { spawnSync } from "node:child_process"
 import test from "node:test"
 import { fileURLToPath } from "node:url"
+import { EventEmitter } from "node:events"
+import { PassThrough } from "node:stream"
 import {
+  clipboardTargets,
+  copyToClipboard,
   createSessionStore,
   apiGet,
   buildSkillPrompt,
@@ -100,6 +104,8 @@ test("shows live slash suggestions for built-in commands and project skills", ()
     { name: "проверка", usage: "/проверка", description: "Проверить проект." },
   ])
   assert.deepEqual(slashCommandSuggestions("/his", catalog).map(({ usage }) => usage), ["/history [число]"])
+  assert.deepEqual(slashCommandSuggestions("/cop", catalog).map(({ usage }) => usage), ["/copy"])
+  assert.deepEqual(slashCommandSuggestions("/ren", catalog).map(({ usage }) => usage), ["/rename <название>"])
   assert.deepEqual(slashCommandSuggestions("/help later", catalog), [])
   assert.deepEqual(slashCommandSuggestions("//tmp/project", catalog), [])
 })
@@ -110,6 +116,32 @@ test("shows live choices for slash command arguments", () => {
   assert.deepEqual(slashCommandSuggestions("/theme ", catalog).map(({ usage }) => usage), ["/theme purple", "/theme blue", "/theme system"])
   assert.deepEqual(slashCommandSuggestions("/model dreyze/o", catalog).map(({ usage }) => usage), ["/model dreyze/opus"])
   assert.deepEqual(slashCommandSuggestions("/help later", catalog), [])
+})
+
+test("provides safe platform clipboard commands and copies UTF-8 chat replies", async () => {
+  assert.equal(clipboardTargets("darwin")[0].command, "pbcopy")
+  assert.equal(clipboardTargets("win32")[0].encoding, "base64")
+  assert.deepEqual(clipboardTargets("linux").map(({ command }) => command), ["wl-copy", "xclip", "xsel"])
+
+  const copied = []
+  const spawnImpl = (command, args) => {
+    const child = new EventEmitter()
+    child.stdin = new PassThrough()
+    child.stderr = new PassThrough()
+    let input = ""
+    child.stdin.on("data", (chunk) => { input += chunk.toString("utf8") })
+    child.stdin.on("end", () => {
+      copied.push({ command, args, input })
+      setImmediate(() => child.emit("close", 0))
+    })
+    return child
+  }
+  const message = "Ответ на русском 👩‍💻"
+  assert.equal(await copyToClipboard(message, { platformName: "linux", spawnImpl }), "wl-copy")
+  assert.equal(copied[0].input, message)
+  assert.equal(await copyToClipboard(message, { platformName: "win32", spawnImpl }), "powershell.exe")
+  assert.equal(Buffer.from(copied[1].input.trim(), "base64").toString("utf8"), message)
+  assert.match(copied[1].args.at(-1), /Set-Clipboard/u)
 })
 
 test("formats chat messages as terminal-safe panels", () => {
@@ -973,7 +1005,7 @@ test("runs the CLI when invoked through the symlink npm creates for its binary",
   await symlink(cli, command, "file")
   const child = spawnSync(command, ["--version"], { encoding: "utf8" })
   assert.equal(child.status, 0, child.stderr)
-  assert.equal(child.stdout, "DreyzeCode 0.5.13\n")
+  assert.equal(child.stdout, "DreyzeCode 0.5.14\n")
 })
 
 test("help documents image input in both one-shot and interactive modes", async () => {
@@ -982,6 +1014,7 @@ test("help documents image input in both one-shot and interactive modes", async 
   assert.equal(child.status, 0, child.stderr)
   assert.match(child.stdout, /--image PATH/u)
   assert.match(child.stdout, /\/help.*\/attach/u)
+  assert.match(child.stdout, /\/copy.*\/rename/u)
   assert.match(child.stdout, /\/skills/u)
   assert.match(child.stdout, /<имя-папки>/u)
   assert.match(child.stdout, /подсказки появляются при вводе/u)
