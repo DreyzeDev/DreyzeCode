@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url"
 import { connectMcpServers, listConfiguredMcpServers } from "./mcp-client.mjs"
 import { describeHooks, loadConfiguredHooks, runHookEvent } from "./hooks.mjs"
 
-export const VERSION = "0.5.17"
+export const VERSION = "0.5.18"
 const MAX_STEPS = 80
 const MAX_HISTORY = 40
 const DEFAULT_HISTORY_DISPLAY_MESSAGES = 8
@@ -26,8 +26,9 @@ const MAX_IMAGES_PER_MESSAGE = 6
 const MAX_PROJECT_INSTRUCTION_FILES = 40
 const MAX_PROJECT_INSTRUCTION_CHARS = 24_000
 const MAX_PROJECT_INSTRUCTION_FILE_BYTES = 32_000
-const MAX_PROJECT_SKILLS = 40
-const MAX_PROJECT_SKILL_CHARS = 12_000
+const MAX_SKILLS_PER_SCOPE = 40
+const MAX_SKILL_INDEX_CHARS = 12_000
+const MAX_SKILL_FILE_BYTES = 32_000
 const IGNORED_SEARCH_DIRS = new Set([".git", ".next", ".turbo", ".venv", "venv", "build", "dist", "node_modules", "target", "vendor", "coverage"])
 const MUTATING_TOOLS = new Set(["create_directory", "copy_file", "move_file", "write_file", "edit_file", "delete_file", "run_command", "delegate_task"])
 const PLAN_TOOLS = new Set(["list_files", "read_file", "search_text", "web_search", "ask_user"])
@@ -37,7 +38,7 @@ export const SLASH_COMMANDS = Object.freeze([
   { name: "model", usage: "/model [название]", description: "выбрать модель или показать каталог" },
   { name: "review", usage: "/review [область]", description: "проверить изменения без записи файлов" },
   { name: "init", usage: "/init", description: "подготовить инструкции проекта Dreyze" },
-  { name: "skills", usage: "/skills", description: "показать доступные skills проекта" },
+  { name: "skills", usage: "/skills", description: "показать личные и проектные skills" },
   { name: "hooks", usage: "/hooks", description: "показать локальные хуки проекта" },
   { name: "attach", usage: "/attach <путь>", description: "добавить изображение к следующему сообщению" },
   { name: "detach", usage: "/detach", description: "убрать вложения следующего сообщения" },
@@ -231,26 +232,54 @@ export function isSlashCommandPalette(input) {
   return typeof input === "string" && input.trim() === "/"
 }
 
-export async function buildSkillPrompt(skill, roots, request = "") {
-  if (!skill || typeof skill.path !== "string" || !Array.isArray(roots) || !roots.length) {
+export async function buildSkillPrompt(skill, roots, request = "", { userSkillsRoot = join(configRoot, "skills") } = {}) {
+  if (!skill || typeof skill.path !== "string") {
     throw new Error("Не удалось загрузить инструкции выбранного skill.")
   }
-  const addDirectoryMatch = /^--add-dir\s+(\d+)\/(.+)$/u.exec(skill.path)
-  const projectMatch = /^\.\/(.+)$/u.exec(skill.path)
-  const rootIndex = addDirectoryMatch ? Number(addDirectoryMatch[1]) - 1 : 0
-  const relativePath = addDirectoryMatch?.[2] ?? projectMatch?.[1]
-  if (!relativePath || !roots[rootIndex]) throw new Error("Путь к skill находится вне разрешённых папок.")
-  const pathname = await resolveWorkspacePath(resolve(roots[rootIndex], relativePath), roots, { mustExist: true })
+  let pathname
+  const userMatch = /^@user\/(skills\/.+)$/u.exec(skill.path)
+  if (userMatch) {
+    const canonicalContainer = await realpath(dirname(userSkillsRoot)).catch(() => null)
+    const candidateSkillsRoot = resolve(userSkillsRoot)
+    const rootInfo = await lstat(candidateSkillsRoot).catch(() => null)
+    const canonicalSkillsRoot = await realpath(candidateSkillsRoot).catch(() => null)
+    if (!canonicalContainer || !rootInfo?.isDirectory() || rootInfo.isSymbolicLink() || !canonicalSkillsRoot || !within(canonicalContainer, canonicalSkillsRoot)) {
+      throw new Error("Личный каталог skills недоступен или использует символическую ссылку.")
+    }
+    const relativePath = userMatch[1]
+    const segments = relativePath.split("/")
+    if (segments[0] !== "skills" || segments.length !== 3 || segments.some((segment) => !segment || segment === "." || segment === ".." || /[\\/]/u.test(segment))) {
+      throw new Error("Путь к личному skill некорректен.")
+    }
+    let current = canonicalContainer
+    for (const segment of segments) {
+      current = join(current, segment)
+      const info = await lstat(current).catch(() => null)
+      if (!info || info.isSymbolicLink()) throw new Error("Личный skill отсутствует или проходит через символическую ссылку.")
+    }
+    const canonicalFile = await realpath(current).catch(() => null)
+    if (!canonicalFile || !within(canonicalSkillsRoot, canonicalFile)) throw new Error("Путь к личному skill находится вне разрешённого каталога.")
+    pathname = canonicalFile
+  } else {
+    if (!Array.isArray(roots) || !roots.length) throw new Error("Путь к skill находится вне разрешённых папок.")
+    const addDirectoryMatch = /^--add-dir\s+(\d+)\/(.+)$/u.exec(skill.path)
+    const projectMatch = /^\.\/(.+)$/u.exec(skill.path)
+    const rootIndex = addDirectoryMatch ? Number(addDirectoryMatch[1]) - 1 : 0
+    const relativePath = addDirectoryMatch?.[2] ?? projectMatch?.[1]
+    if (!relativePath || !roots[rootIndex]) throw new Error("Путь к skill находится вне разрешённых папок.")
+    pathname = await resolveWorkspacePath(resolve(roots[rootIndex], relativePath), roots, { mustExist: true })
+  }
   const info = await lstat(pathname)
-  if (!info.isFile() || info.isSymbolicLink() || info.size < 1 || info.size > MAX_PROJECT_INSTRUCTION_FILE_BYTES) {
+  if (!info.isFile() || info.isSymbolicLink() || info.size < 1 || info.size > MAX_SKILL_FILE_BYTES) {
     throw new Error("Файл выбранного skill пуст, слишком велик или недоступен.")
   }
   const rawBody = (await readFile(pathname, "utf8")).replace(/^\uFEFF/u, "")
   const skillBody = rawBody.replace(/^---\s*\r?\n[\s\S]*?\r?\n---\s*(?:\r?\n|$)/u, "")
-  const body = redactSecrets(skillBody).slice(0, MAX_PROJECT_SKILL_CHARS)
+  const body = redactSecrets(skillBody).slice(0, MAX_SKILL_INDEX_CHARS)
   if (!body.trim()) throw new Error("Файл выбранного skill не содержит инструкций.")
   const task = typeof request === "string" ? request.trim() : ""
-  return `Примени проектный skill «${skill.name}» и выполни задачу по его инструкциям.\n\nИнструкции skill:\n---\n${body}\n---\n\nЗадача пользователя:\n${task || "Примени эти инструкции к текущему проекту."}`
+  const scope = userMatch ? "личный" : "проектный"
+  return `Примени ${scope} skill «${skill.name}» и выполни задачу по его инструкциям.\n\nИнструкции skill:\n---\n${body}\n---\n\nЗадача пользователя:\n${task || "Примени эти инструкции к текущему проекту."}`
 }
 
 export function completeSlashInput(line, catalog = { models: [] }) {
@@ -332,10 +361,11 @@ export function slashCommandSuggestions(line, catalog = { models: [], skills: []
   for (const skill of Array.isArray(catalog?.skills) ? catalog.skills : []) {
     const name = skill?.commandName ?? skill?.name
     if (typeof name !== "string" || !/^\p{L}[\p{L}\p{N}-]*$/iu.test(name)) continue
+    const scope = skill.path?.startsWith("@user/") ? "личный skill" : "skill проекта"
     commands.push({
       name,
       usage: `/${name}`,
-      description: skill?.description || `проектный skill · ${skill?.name || name}`,
+      description: skill?.description || `${scope} · ${skill?.name || name}`,
     })
   }
   const seen = new Set()
@@ -456,17 +486,17 @@ function printHelp() {
     `  dreyzecode models list                 показать доступные модели\n` +
     `  dreyzecode sessions list               найти локальные сессии проекта\n` +
     `  dreyzecode sessions show <id>          вывести локальную сессию\n` +
-    `  dreyzecode skills list                 показать skills проекта\n` +
+    `  dreyzecode skills list                 показать личные и проектные skills\n` +
     `  dreyzecode hooks list                  показать hooks проекта и пользователя\n` +
     `  dreyzecode mcp list                    показать настроенные MCP серверы\n` +
     `  dreyzecode api get /api/...            безопасный GET к API Dreyze\n\n` +
     `Параметры: --model ID, --mode build|plan, --add-dir PATH, --image PATH (повторяемый), --session ID, --json, --yes\n` +
     `В Build изменения файлов и команды требуют подтверждения. Plan разрешает только чтение.\n` +
     `В интерактивном режиме: подсказки появляются при вводе /; Enter / открывает полный список.\n` +
-    `Tab дополняет команды проекта, режимы, темы и модели.\n` +
+    `Tab дополняет команды Dreyze, личные и проектные skills, режимы, темы и модели.\n` +
     `Ctrl+C останавливает текущую задачу, сохраняя сессию; /exit завершает чат.\n` +
     `Команды: /help, /skills, /hooks, /review, /init, /mode, /model, /attach, /detach, /theme, /status, /history, /copy, /rename, /sessions, /resume, /new, /clear, /exit.\n` +
-    `Проектный skill запускается как /<имя-папки> задача.\n`)
+    `Личный или проектный skill запускается как /<имя-папки> задача.\n`)
 }
 
 function jsonOut(value) {
@@ -1521,75 +1551,97 @@ export async function loadProjectInstructions(roots) {
   return files
 }
 
-export async function loadProjectSkills(roots) {
-  const skills = []
-  let remaining = MAX_PROJECT_SKILL_CHARS
-  const seen = new Set()
-  const seenNames = new Set()
-  for (const root of roots) {
-    if (skills.length >= MAX_PROJECT_SKILLS || remaining <= 0) break
-    const candidateRoot = join(root, ".dreyze", "skills")
-    const rootInfo = await lstat(candidateRoot).catch(() => null)
-    if (!rootInfo?.isDirectory() || rootInfo.isSymbolicLink()) continue
-    const skillsRoot = await realpath(candidateRoot).catch(() => null)
-    if (!skillsRoot || !within(root, skillsRoot)) continue
-    const entries = await readdir(skillsRoot, { withFileTypes: true }).catch(() => [])
-    entries.sort((a, b) => a.name.localeCompare(b.name))
-    for (const entry of entries) {
-      if (skills.length >= MAX_PROJECT_SKILLS || remaining <= 0) break
-      if (!entry.isDirectory() || !entry.name.trim() || entry.name.length > 80 || /[\u0000-\u001f\u007f]/u.test(entry.name)) continue
-      const directory = join(skillsRoot, entry.name)
-      const dirInfo = await lstat(directory).catch(() => null)
-      if (!dirInfo?.isDirectory() || dirInfo.isSymbolicLink()) continue
-      const skillFile = join(directory, "SKILL.md")
-      const fileInfo = await lstat(skillFile).catch(() => null)
-      if (!fileInfo?.isFile() || fileInfo.isSymbolicLink() || fileInfo.size < 1 || fileInfo.size > MAX_PROJECT_INSTRUCTION_FILE_BYTES) continue
-      const canonicalFile = await realpath(skillFile).catch(() => null)
-      if (!canonicalFile || !within(root, canonicalFile) || seen.has(canonicalFile)) continue
-      const content = (await readFile(canonicalFile, "utf8").catch(() => "")).replace(/^\uFEFF/u, "")
-      const frontMatter = content.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/u)?.[1] ?? ""
-      const scalar = (key) => {
-        const lines = frontMatter.split(/\r?\n/u)
-        const index = lines.findIndex((line) => new RegExp(`^\\s*${key}\\s*:`, "iu").test(line))
-        if (index < 0) return ""
-        const value = lines[index].replace(new RegExp(`^\\s*${key}\\s*:\\s*`, "iu"), "").trim()
-        if (!value) return ""
-        if (/^[>|][+-]?$/u.test(value)) {
-          const block = []
-          for (let lineIndex = index + 1; lineIndex < lines.length; lineIndex++) {
-            const line = lines[lineIndex]
-            if (line.trim() && !/^\s/u.test(line)) break
-            if (line.trim()) block.push(line.trim())
-          }
-          return block.join(" ")
+async function loadSkillsFromRoot(candidateRoot, containerRoot, pathPrefix, state) {
+  if (state.skills.length >= MAX_SKILLS_PER_SCOPE || state.remaining <= 0) return
+  const rootInfo = await lstat(candidateRoot).catch(() => null)
+  if (!rootInfo?.isDirectory() || rootInfo.isSymbolicLink()) return
+  const [canonicalContainer, skillsRoot] = await Promise.all([
+    realpath(containerRoot).catch(() => null),
+    realpath(candidateRoot).catch(() => null),
+  ])
+  if (!canonicalContainer || !skillsRoot || !within(canonicalContainer, skillsRoot)) return
+  const entries = await readdir(skillsRoot, { withFileTypes: true }).catch(() => [])
+  entries.sort((a, b) => a.name.localeCompare(b.name))
+  for (const entry of entries) {
+    if (state.skills.length >= MAX_SKILLS_PER_SCOPE || state.remaining <= 0) break
+    if (!entry.isDirectory() || !entry.name.trim() || entry.name.length > 80 || /[\u0000-\u001f\u007f]/u.test(entry.name)) continue
+    const directory = join(skillsRoot, entry.name)
+    const dirInfo = await lstat(directory).catch(() => null)
+    if (!dirInfo?.isDirectory() || dirInfo.isSymbolicLink()) continue
+    const skillFile = join(directory, "SKILL.md")
+    const fileInfo = await lstat(skillFile).catch(() => null)
+    if (!fileInfo?.isFile() || fileInfo.isSymbolicLink() || fileInfo.size < 1 || fileInfo.size > MAX_SKILL_FILE_BYTES) continue
+    const canonicalFile = await realpath(skillFile).catch(() => null)
+    if (!canonicalFile || !within(skillsRoot, canonicalFile) || !within(canonicalContainer, canonicalFile) || state.seen.has(canonicalFile)) continue
+    const content = (await readFile(canonicalFile, "utf8").catch(() => "")).replace(/^\uFEFF/u, "")
+    const frontMatter = content.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/u)?.[1] ?? ""
+    const scalar = (key) => {
+      const lines = frontMatter.split(/\r?\n/u)
+      const index = lines.findIndex((line) => new RegExp(`^\\s*${key}\\s*:`, "iu").test(line))
+      if (index < 0) return ""
+      const value = lines[index].replace(new RegExp(`^\\s*${key}\\s*:\\s*`, "iu"), "").trim()
+      if (!value) return ""
+      if (/^[>|][+-]?$/u.test(value)) {
+        const block = []
+        for (let lineIndex = index + 1; lineIndex < lines.length; lineIndex++) {
+          const line = lines[lineIndex]
+          if (line.trim() && !/^\s/u.test(line)) break
+          if (line.trim()) block.push(line.trim())
         }
-        if (value.startsWith('"') && value.endsWith('"')) {
-          try { return JSON.parse(value) } catch { return value.slice(1, -1) }
-        }
-        if (value.startsWith("'") && value.endsWith("'")) return value.slice(1, -1).replace(/''/gu, "'")
-        return value
+        return block.join(" ")
       }
-      const name = redactSecrets(scalar("name") || entry.name).trim().slice(0, 80)
-      const commandName = entry.name.normalize("NFC").toLowerCase().replace(/[^\p{L}\p{N}-]+/gu, "-").replace(/^-+|-+$/gu, "").slice(0, 80)
-      if (!name || !/^\p{L}[\p{L}\p{N}-]{0,79}$/u.test(commandName) || SLASH_COMMAND_NAMES.has(commandName) || seenNames.has(commandName)) continue
-      const description = redactSecrets(scalar("description")).slice(0, 800)
-      const rootLabel = roots.indexOf(root) === 0 ? "." : `--add-dir ${roots.indexOf(root) + 1}`
-      const path = relative(root, canonicalFile).split(sep).join("/")
-      const skill = { name, commandName, path: `${rootLabel}/${path}`, description }
-      const size = skill.name.length + skill.commandName.length + skill.path.length + skill.description.length
-      if (size > remaining) {
-        const shortenedDescription = skill.description.slice(0, Math.max(0, remaining - skill.name.length - skill.commandName.length - skill.path.length))
-        skill.description = shortenedDescription
+      if (value.startsWith('"') && value.endsWith('"')) {
+        try { return JSON.parse(value) } catch { return value.slice(1, -1) }
       }
-      const finalSize = skill.name.length + skill.commandName.length + skill.path.length + skill.description.length
-      if (!finalSize || finalSize > remaining) continue
-      seen.add(canonicalFile)
-      seenNames.add(commandName)
-      skills.push(skill)
-      remaining -= finalSize
+      if (value.startsWith("'") && value.endsWith("'")) return value.slice(1, -1).replace(/''/gu, "'")
+      return value
     }
+    const name = redactSecrets(scalar("name") || entry.name).trim().slice(0, 80)
+    const commandName = entry.name.normalize("NFC").toLowerCase().replace(/[^\p{L}\p{N}-]+/gu, "-").replace(/^-+|-+$/gu, "").slice(0, 80)
+    if (!name || !/^\p{L}[\p{L}\p{N}-]{0,79}$/u.test(commandName) || SLASH_COMMAND_NAMES.has(commandName) || state.seenNames.has(commandName)) continue
+    const description = redactSecrets(scalar("description")).slice(0, 800)
+    const path = relative(canonicalContainer, canonicalFile).split(sep).join("/")
+    const skill = { name, commandName, path: `${pathPrefix}/${path}`, description }
+    const size = skill.name.length + skill.commandName.length + skill.path.length + skill.description.length
+    if (size > state.remaining) skill.description = skill.description.slice(0, Math.max(0, state.remaining - skill.name.length - skill.commandName.length - skill.path.length))
+    const finalSize = skill.name.length + skill.commandName.length + skill.path.length + skill.description.length
+    if (!finalSize || finalSize > state.remaining) continue
+    state.seen.add(canonicalFile)
+    state.seenNames.add(commandName)
+    state.skills.push(skill)
+    state.remaining -= finalSize
   }
-  return skills
+}
+
+function newSkillState(existingSkills = []) {
+  return {
+    skills: [],
+    remaining: MAX_SKILL_INDEX_CHARS,
+    seen: new Set(),
+    seenNames: new Set(existingSkills.map((skill) => skill.commandName)),
+  }
+}
+
+export async function loadProjectSkills(roots) {
+  const state = newSkillState()
+  for (let index = 0; index < roots.length; index++) {
+    const root = roots[index]
+    const label = index === 0 ? "." : `--add-dir ${index + 1}`
+    await loadSkillsFromRoot(join(root, ".dreyze", "skills"), root, label, state)
+  }
+  return state.skills
+}
+
+export async function loadUserSkills({ userSkillsRoot = join(configRoot, "skills"), existingSkills = [] } = {}) {
+  const state = newSkillState(existingSkills)
+  await loadSkillsFromRoot(userSkillsRoot, dirname(userSkillsRoot), "@user", state)
+  return state.skills
+}
+
+export async function loadAvailableSkills(roots, options = {}) {
+  const projectSkills = await loadProjectSkills(roots)
+  const userSkills = await loadUserSkills({ ...options, existingSkills: projectSkills })
+  return [...projectSkills, ...userSkills]
 }
 
 function promptInterface(jsonMode = false, catalog = { models: [] }) {
@@ -1780,7 +1832,10 @@ function writeChatMessage(title, content, color = (text) => text) {
 
 function printSlashHelp(color, skills = []) {
   const rows = SLASH_COMMANDS.map(({ usage, description }) => `${usage.padEnd(25)} ${description}`)
-  for (const skill of skills) rows.push(`/${skill.commandName} · ${skill.name}\n  ${skill.description || "команда проекта"}`)
+  for (const skill of skills) {
+    const scope = skill.path?.startsWith("@user/") ? "личная" : "проектная"
+    rows.push(`/${skill.commandName} · ${skill.name} (${scope})\n  ${skill.description || "пользовательская команда"}`)
+  }
   rows.push(`${"//текст".padEnd(25)} отправить модели текст, начинающийся с /`)
   rows.push("", "Tab — дополнить команду, режим, тему или модель.", "Enter — отправить задачу · / — снова открыть список.")
   writeChatMessage("Команды DreyzeCode · свои команды", rows.join("\n"), color)
@@ -2016,8 +2071,11 @@ async function interactive(options, config, catalog, initialSession, store, root
         continue
       }
       if (name === "skills") {
-        const rows = (catalog.skills ?? []).map((skill) => `/${skill.commandName} · ${skill.name}\n  ${skill.description || "команда проекта"}`)
-        writeChatMessage("Команды проекта", rows.join("\n") || "В разрешённых папках проекта команды не найдены.", color)
+        const rows = (catalog.skills ?? []).map((skill) => {
+          const scope = skill.path?.startsWith("@user/") ? "личная" : "проектная"
+          return `/${skill.commandName} · ${skill.name} (${scope})\n  ${skill.description || skill.path}`
+        })
+        writeChatMessage("Команды DreyzeCode", rows.join("\n") || "Команды не найдены. Добавьте личный skill в каталог DreyzeCode или проектный в .dreyze/skills/.", color)
         continue
       }
       if (name === "hooks") {
@@ -2219,9 +2277,9 @@ export async function runCli(args = process.argv.slice(2)) {
   if (options.command === "skills") {
     const subcommand = options.positionals[0]
     if (subcommand && subcommand !== "list") throw new Error("Использование: dreyzecode skills list")
-    const skills = await loadProjectSkills(await canonicalRoots(workspace, options.addDirs))
+    const skills = await loadAvailableSkills(await canonicalRoots(workspace, options.addDirs))
     if (options.json) jsonOut({ ok: true, skills })
-    else if (!skills.length) stdout.write("В разрешённых папках проекта skills не найдены.\n")
+    else if (!skills.length) stdout.write("Личные и проектные skills не найдены.\n")
     else for (const skill of skills) stdout.write(`${skill.name}\t${skill.path}\t${skill.description}\n`)
     return
   }
@@ -2272,7 +2330,7 @@ export async function runCli(args = process.argv.slice(2)) {
     return
   }
   const roots = await canonicalRoots(workspace, options.addDirs)
-  const interactiveCatalog = { ...catalog, skills: await loadProjectSkills(roots) }
+  const interactiveCatalog = { ...catalog, skills: await loadAvailableSkills(roots) }
   const store = createSessionStore(workspace)
   const session = await sessionFor(options, store, interactiveCatalog)
   if (options.model && !catalog.models.some((model) => model.id === options.model || model.name.toLowerCase() === options.model.toLowerCase())) {

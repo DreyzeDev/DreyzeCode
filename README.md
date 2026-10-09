@@ -62,12 +62,12 @@ and model replies, and a live status while the model or a local tool is
 working. The composer shows the selected model, mode, and queued image files.
 Slash command suggestions appear as you type, including choices for modes,
 themes, and models. Enter `/` to open the command palette or press Tab to
-complete a command. `/help` lists built-in DreyzeCode commands and project
-commands. `/review [scope]` inspects the project in read-only Plan mode and
+complete a command. `/help` lists built-in DreyzeCode commands and personal or
+project commands. `/review [scope]` inspects the project in read-only Plan mode and
 reports confirmed findings without changing files. `/init` asks the agent to
 create `.dreyze/instructions.md` with project guidance after normal write
-approval. Use `/skill-name task` to run a project command with a task, or
-`/skills` to list project commands. `/copy` puts the latest model reply on the
+approval. Use `/skill-name task` to run a personal or project command with a
+task, or `/skills` to list available commands. `/copy` puts the latest model reply on the
 system clipboard, and `/rename NAME` gives the current conversation a
 recognizable title in the session list. Use `/history [number]` to view recent
 user and assistant messages in the current session; tool payloads stay hidden.
@@ -91,7 +91,14 @@ agent turn. The folder name becomes the slash command (for example,
 skill command reads its instructions from the workspace and combines them with
 your task. `dreyzecode skills list` displays aliases without requiring login.
 Additional approved project folders can contain their own `.dreyze/skills`
-directory.
+directory. Personal skills work in every project and live at
+`~/.config/dreyze-code/skills/<name>/SKILL.md` on Linux and macOS, or
+`%APPDATA%\DreyzeCode\skills\<name>\SKILL.md` on Windows. When
+`XDG_CONFIG_HOME` is set, Linux and macOS use
+`$XDG_CONFIG_HOME/dreyze-code/skills/`. A project skill with the same command
+name takes precedence while you are in that project. Personal skill folders
+are never added to the agent's project filesystem roots; DreyzeCode reads the
+selected instruction file locally when you invoke its slash command.
 
 Local lifecycle hooks can be listed with `/hooks` or `dreyzecode hooks list`.
 Project hooks live in `.dreyze/hooks.json`; user-wide hooks live in
@@ -173,11 +180,12 @@ read-only same-origin escape hatch restricted to `/api/` paths.
 ## Current command contract
 
 - `login`, `logout`, `doctor`, `models list`, `sessions list`, `sessions show`
-- `skills list` for project-local capabilities
+- `skills list` for personal and project-local capabilities
 - `mcp list` for configured local and remote MCP servers
 - Interactive chat, `run`, `--continue`, `--session`, `--model`, and `--mode`
 - Slash commands for review, project setup, hooks, chat history, copying
-  replies, naming and resuming sessions, themes, models, and project skills
+  replies, naming and resuming sessions, themes, models, and personal or
+  project skills
 - Local tools: list/read/search, image input, create/copy/move/write/edit/delete
   files, create folders, run approved commands, search the web using the
   account's monthly search allowance, ask the user, and start a read-only

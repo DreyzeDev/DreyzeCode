@@ -21,8 +21,10 @@ import {
   formatChatComposer,
   isSlashCommandPalette,
   isSensitivePath,
+  loadAvailableSkills,
   loadProjectInstructions,
   loadProjectSkills,
+  loadUserSkills,
   parseArgs,
   parseSlashCommand,
   redactSecrets,
@@ -100,10 +102,11 @@ test("completes slash commands and their mode, theme, and model arguments", () =
   assert.equal(slashTabCompletion("/mode ", catalog), "")
 })
 
-test("shows live slash suggestions for built-in commands and project skills", () => {
+test("shows live slash suggestions for built-in, project, and personal skills", () => {
   const catalog = {
     skills: [
-      { commandName: "interface-review", name: "Interface Review", description: "Review the interface." },
+      { commandName: "interface-review", name: "Interface Review", description: "Review the interface.", path: "./.dreyze/skills/interface-review/SKILL.md" },
+      { commandName: "my-check", name: "My Check", description: "Check any repository.", path: "@user/skills/my-check/SKILL.md" },
       { commandName: "проверка", name: "Проверка", description: "Проверить проект." },
     ],
   }
@@ -112,6 +115,9 @@ test("shows live slash suggestions for built-in commands and project skills", ()
   ])
   assert.deepEqual(slashCommandSuggestions("/interface", catalog), [
     { name: "interface-review", usage: "/interface-review", description: "Review the interface." },
+  ])
+  assert.deepEqual(slashCommandSuggestions("/my-check", catalog), [
+    { name: "my-check", usage: "/my-check", description: "Check any repository." },
   ])
   assert.deepEqual(slashCommandSuggestions("/пров", catalog), [
     { name: "проверка", usage: "/проверка", description: "Проверить проект." },
@@ -643,6 +649,91 @@ test("loads a selected skill body locally for its slash command and user task", 
   assert.doesNotMatch(prompt, /description: Review the project structure/u)
 })
 
+test("discovers personal slash skills without adding the personal directory to project roots", async (t) => {
+  const { workspace, config } = await fixture(t)
+  const projectDir = path.join(workspace, ".dreyze", "skills", "project-check")
+  await mkdir(projectDir, { recursive: true })
+  await writeFile(path.join(projectDir, "SKILL.md"), "---\nname: Project Check\ndescription: Project rules.\n---\n")
+  const userSkillsRoot = path.join(config, "dreyze-code", "skills")
+  const skillDir = path.join(userSkillsRoot, "my-check")
+  await mkdir(skillDir, { recursive: true })
+  await writeFile(path.join(skillDir, "SKILL.md"), [
+    "---",
+    "name: My Check",
+    "description: Check any repository using my own checklist.",
+    "---",
+    "",
+    "Inspect the current repository and report concise findings.",
+  ].join("\n"))
+  const projectSkills = await loadProjectSkills([workspace])
+  const skills = await loadAvailableSkills([workspace], { userSkillsRoot })
+  const personal = await loadUserSkills({ userSkillsRoot, existingSkills: projectSkills })
+  assert.deepEqual(personal, [{
+    name: "My Check",
+    commandName: "my-check",
+    path: "@user/skills/my-check/SKILL.md",
+    description: "Check any repository using my own checklist.",
+  }])
+  assert.deepEqual(skills, [...projectSkills, ...personal])
+  assert.deepEqual(skills.map(({ path: skillPath }) => skillPath), [
+    "./.dreyze/skills/project-check/SKILL.md",
+    "@user/skills/my-check/SKILL.md",
+  ])
+  const prompt = await buildSkillPrompt(personal[0], [], "Review this project", { userSkillsRoot })
+  assert.match(prompt, /личный skill «My Check»/u)
+  assert.match(prompt, /Inspect the current repository/u)
+  assert.match(prompt, /Review this project/u)
+})
+
+test("project slash skills take precedence over same-named personal skills", async (t) => {
+  const { workspace, config } = await fixture(t)
+  const projectSkill = path.join(workspace, ".dreyze", "skills", "release")
+  const personalSkill = path.join(config, "dreyze-code", "skills", "release")
+  await mkdir(projectSkill, { recursive: true })
+  await mkdir(personalSkill, { recursive: true })
+  await writeFile(path.join(projectSkill, "SKILL.md"), "---\nname: Project Release\n---\n")
+  await writeFile(path.join(personalSkill, "SKILL.md"), "---\nname: Personal Release\n---\n")
+  const skills = await loadAvailableSkills([workspace], { userSkillsRoot: path.join(config, "dreyze-code", "skills") })
+  assert.equal(skills.length, 1)
+  assert.equal(skills[0].name, "Project Release")
+  assert.equal(skills[0].path, "./.dreyze/skills/release/SKILL.md")
+})
+
+test("does not discover or load personal skills through symlinks", async (t) => {
+  const { root, config } = await fixture(t)
+  const userSkillsRoot = path.join(config, "dreyze-code", "skills")
+  const skillDir = path.join(userSkillsRoot, "linked")
+  await mkdir(skillDir, { recursive: true })
+  const outside = path.join(root, "outside-SKILL.md")
+  await writeFile(outside, "Do not load instructions through links.\n")
+  try {
+    await symlink(outside, path.join(skillDir, "SKILL.md"), "file")
+  } catch (error) {
+    if (process.platform === "win32" && ["EPERM", "EACCES", "ENOTSUP"].includes(error?.code)) {
+      t.skip("Windows runner does not permit creating symlinks")
+      return
+    }
+    throw error
+  }
+  assert.deepEqual(await loadUserSkills({ userSkillsRoot }), [])
+  await assert.rejects(
+    buildSkillPrompt({ name: "Linked", path: "@user/skills/linked/SKILL.md" }, [], "", { userSkillsRoot }),
+    /символическую ссылку/u,
+  )
+})
+
+test("rejects traversal paths for personal slash skills", async (t) => {
+  const { config } = await fixture(t)
+  const userSkillsRoot = path.join(config, "dreyze-code", "skills")
+  await mkdir(userSkillsRoot, { recursive: true })
+  await assert.rejects(
+    buildSkillPrompt({ name: "Unsafe", path: "@user/skills/../../outside/SKILL.md" }, [], "", {
+      userSkillsRoot,
+    }),
+    /Путь к личному skill некорректен/u,
+  )
+})
+
 test("refuses a slash skill path outside the selected workspace", async (t) => {
   const { workspace } = await fixture(t)
   await assert.rejects(
@@ -668,6 +759,26 @@ test("lists workspace skills without requiring a Dreyze login", async (t) => {
     commandName: "release",
     path: "./.dreyze/skills/release/SKILL.md",
     description: "Release checklist.",
+  }])
+})
+
+test("lists personal slash skills without requiring a Dreyze login", async (t) => {
+  const { workspace, config } = await fixture(t)
+  const skillDir = path.join(config, "dreyze-code", "skills", "my-review")
+  await mkdir(skillDir, { recursive: true })
+  await writeFile(path.join(skillDir, "SKILL.md"), "---\nname: My Review\ndescription: My personal checklist.\n---\n")
+  const cli = fileURLToPath(new URL("../cli.mjs", import.meta.url))
+  const child = spawnSync(process.execPath, [cli, "--json", "skills", "list"], {
+    cwd: workspace,
+    env: { ...process.env, XDG_CONFIG_HOME: config },
+    encoding: "utf8",
+  })
+  assert.equal(child.status, 0, child.stderr)
+  assert.deepEqual(JSON.parse(child.stdout).skills, [{
+    name: "My Review",
+    commandName: "my-review",
+    path: "@user/skills/my-review/SKILL.md",
+    description: "My personal checklist.",
   }])
 })
 
@@ -1144,7 +1255,7 @@ test("runs the CLI when invoked through the symlink npm creates for its binary",
   await symlink(cli, command, "file")
   const child = spawnSync(command, ["--version"], { encoding: "utf8" })
   assert.equal(child.status, 0, child.stderr)
-  assert.equal(child.stdout, "DreyzeCode 0.5.17\n")
+  assert.equal(child.stdout, "DreyzeCode 0.5.18\n")
 })
 
 test("help documents image input in both one-shot and interactive modes", async () => {
